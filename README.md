@@ -1,6 +1,6 @@
 # wx-observer
 
-面向 Windows 10 / 11 微信 4.x（`Weixin.exe`）的**纯只读**本地聊天记录提取与实时消息观察工具，原生提供 CLI 与 MCP Server（`stdio` / Streamable HTTP）。
+面向 Windows 10 / 11 微信 4.x（`Weixin.exe`）的**纯只读**本地聊天记录提取与实时消息观察工具，原生提供 CLI、MCP Server（`stdio` / Streamable HTTP）以及开箱即用的场景化 Agent Skills。
 
 > [!CAUTION]
 > **免责与学习声明（仅供学习研究使用）**
@@ -18,6 +18,7 @@
 - **服务端跨会话摘要与本地附件定位**：新增 `digest` 工具在服务端通过单遍跨分片批量扫描聚合私聊/群聊统计、按小时/按天分布、`top_senders`、URL 外链、`@提及` 与高信号摘要，并默认内置 `max_chats=20` 与 `token_budget=4000` 硬预算控制；新增 `list_attachments` 解析群/私聊文件及转发聊天记录（`chat_history`）内嵌文件对应的本地明文路径，支持 Windows `(1)/(2)` 重名后缀与 MD5/文件大小置信度校验。
 - **至少一次（At-Least-Once）实时增量监控**：基于 SQLite `-wal` 增量帧合并与 `sort_seq` 组原子投递，各 `cursor_id` 独立持久化断点防重启漏消息；MCP 端 `poll_new_messages` / `wait_for_messages` 默认 `peek=True` 返回 `ack_token`，消费完成后调用 `ack_messages` 才推进持久化水位，防止 Agent 超时或压缩上下文时丢消息；CLI `watch` 保持连续自动提交。
 - **Agent 原生 MCP 接入**：内置标准 MCP Server，提供 12 个标注 `readOnlyHint=true` 的只读工具，同时支持 `stdio`（客户端拉起）与本机 `127.0.0.1` Streamable HTTP（可选 Bearer Token 鉴权）。
+- **内置 4 个通用场景 Agent Skills**：在 `skills/` 目录提供 `wx-brief`（动态速览）、`wx-find`（找消息与文件）、`wx-todo`（待办与 DDL）与 `wx-watch`（只读盯盘）四个轻量场景指南，引导 Agent 按预算与最小开销组合调用工具，并支持无 MCP 时的 CLI 回退。
 
 ---
 
@@ -75,7 +76,8 @@ sequenceDiagram
 5. 为当前客户端配置好该 MCP Server（stdio 模式）：
    - command 指向 `<repo>\.venv\Scripts\wx-observer.exe`
    - args 为 `["mcp", "--transport", "stdio"]`
-6. 如需独立多客户端接入，顺便告诉我如何用 `--transport http --host 127.0.0.1 --port 8765 --token <自定义密钥>` 启动 Streamable HTTP 模式，并验证 MCP 工具列表可用。
+6. 将仓库 `skills/` 下的 4 个内置场景 Skill（`wx-brief`、`wx-find`、`wx-todo`、`wx-watch`）复制到当前客户端的全局或工作区 Skills 目录中，以便后续直接按场景调用。
+7. 如需独立多客户端接入，顺便告诉我如何用 `--transport http --host 127.0.0.1 --port 8765 --token <自定义密钥>` 启动 Streamable HTTP 模式，并验证 MCP 工具列表可用。
 ```
 
 ---
@@ -184,6 +186,23 @@ python -m venv .venv
 | `ack_messages` | 使用 `poll_new_messages` / `wait_for_messages` 返回的 `ack_token`（及可选 `upto`）原子提交该 `cursor_id` 水位 |
 | `wait_for_messages` | 长轮询等待新消息（收到即返回，超时返回空列表）；默认 `peek=True` 与 `detail="compact"` |
 | `get_status` | 查看目标账号状态、解锁数据库数、监控过滤规则与游标进度 |
+
+### 4. 内置场景化 Agent Skills
+
+MCP 提供 12 个通用只读原语，而 `skills/` 下的 4 个轻量 `SKILL.md` 则按真实使用意图规定了最优调用顺序、预算控制与只读边界（同时附带无 MCP 时的 CLI 回退命令）：
+
+| Skill | 目录位置 | 适用场景 | 核心工具组合 |
+| --- | --- | --- | --- |
+| `wx-brief` | [`skills/wx-brief/SKILL.md`](skills/wx-brief/SKILL.md) | 群日报/周报、复盘与错过的重点速览 | `digest`（4000 token 预算）→ 定向 `get_messages` 补上下文 |
+| `wx-find` | [`skills/wx-find/SKILL.md`](skills/wx-find/SKILL.md) | 统一查找历史消息、某人原话、链接与本地附件（含转发文件） | `search_messages` + `list_attachments` → `get_messages(before/after_seq)` + 直读 `local_path` |
+| `wx-todo` | [`skills/wx-todo/SKILL.md`](skills/wx-todo/SKILL.md) | 提取待办事项、`@我` 请求、任务/作业、DDL 与未收尾承诺 | `digest(include=["mentions","attachments","highlights"])` → `get_messages` 核验是否已闭环 |
+| `wx-watch` | [`skills/wx-watch/SKILL.md`](skills/wx-watch/SKILL.md) | 独立游标实时盯盘、紧急消息分诊与至少一次增量提醒 | 独立 `cursor_id` + `configure_watch` + `poll_new_messages`/`wait_for_messages(peek=True)` + `ack_messages` |
+
+将所需文件夹（或全部 4 个）复制到你的 Agent 客户端对应的 Skills 目录即可按需加载（例如工作区 `.agents/skills/` 或用户全局 `~/.agents/skills/` / `~/.claude/skills/`）：
+
+```powershell
+Copy-Item -Recurse -Force .\skills\wx-* "$HOME\.agents\skills\"
+```
 
 ---
 
