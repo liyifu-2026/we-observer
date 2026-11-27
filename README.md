@@ -72,7 +72,7 @@ sequenceDiagram
 请帮我在本地安装并配置开源项目 https://github.com/liyifu-2026/we-observer.git （纯只读微信 4.x 观察与 MCP 工具）：
 
 1. 确认环境为 Windows 64 位且已安装 Python 3.11+ 与 git；将仓库克隆到合适目录（例如 C:\Tools\wx-observer 或当前工作区旁边的 wx-observer）。
-2. 在仓库内创建独立虚拟环境 .venv，升级 pip/setuptools/wheel 后执行可编辑安装（pip install -e ".[dev]"）。
+2. 在仓库内创建独立虚拟环境 .venv，升级 pip/setuptools/wheel 后执行可编辑安装（`pip install -e ".[dev]"`）；若系统 Python 的 `ensurepip` 报错请用 `python -m venv --without-pip .venv` 并使用宿主 `python -m pip --python .\.venv\Scripts\python.exe` 引导安装，若直连 PyPI 较慢可加镜像参数 `-i https://pypi.tuna.tsinghua.edu.cn/simple`。
 3. 运行单元测试（pytest -v tests）确认所有离线测试通过。
 4. 运行 `<venv>\Scripts\wx-observer.exe accounts --json` 验证命令可正常执行（如当前本机未打开微信或未登录，只需如实告知我）。
 5. 为当前客户端配置好该 MCP Server（stdio 模式）：
@@ -96,8 +96,12 @@ python -m venv .venv
 ```
 
 > [!NOTE]
-> 若当前系统 Python 的 `ensurepip` 精简缺失导致 `python -m venv` 报错，可改用宿主 Python 引导安装虚拟环境内的 pip：
-> `python -m pip --python .\.venv\Scripts\python.exe install --upgrade pip setuptools wheel`
+> - 若当前系统 Python 的 `ensurepip` 精简缺失导致 `python -m venv .venv` 报错，可改用 `--without-pip` 并通过宿主 Python 引导安装虚拟环境内的 `pip`：
+>   ```powershell
+>   python -m venv --without-pip .venv
+>   python -m pip --python .\.venv\Scripts\python.exe install --upgrade pip setuptools wheel
+>   ```
+> - 若网络直连官方 PyPI 较慢或超时，可在 `pip install` 后追加镜像源 `-i https://pypi.tuna.tsinghua.edu.cn/simple`。
 
 运行离线单元测试：
 
