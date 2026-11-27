@@ -13,10 +13,11 @@
 
 ## 核心特性
 
-- **后台账号实时识别与切换**：动态枚举本机运行中的 `Weixin.exe` 进程及其打开的 `db_storage` 句柄，自动定位自定义/迁移后的存储目录，清晰区分在线进程账号（含多开场景）与离线历史目录。
-- **私聊与群聊历史提取及检索**：跨 `message_*.db` 分片合并查询，按分片独立 `Name2Id` 精确还原发送者，支持按 `chat_id` / 备注 / 昵称 / 群名模糊匹配，支持时间区间、发送者、消息类型与关键词过滤（兼容 zstd 压缩长文与引用回复解析），CLI 支持导出 JSON / JSONL / CSV / Markdown。
-- **实时增量监控与多消费端游标隔离**：基于 SQLite `-wal` 增量帧合并与 `sort_seq` 组原子投递，支持全量 / 仅私聊 / 仅群聊 / 指定会话白名单与排除名单、是否包含自己发出消息开关；首次监听以当前最新消息建立基线不洪泛历史，各 `cursor_id` 独立持久化断点防重启漏消息。
-- **Agent 原生 MCP 接入**：内置标准 MCP Server，提供 9 个标注 `readOnlyHint=true` 的只读工具，同时支持 `stdio`（客户端拉起）与本机 `127.0.0.1` Streamable HTTP（可选 Bearer Token 鉴权），并内置长轮询 `wait_for_messages` 工具。
+- **后台账号实时识别与无状态查询**：动态枚举本机运行中的 `Weixin.exe` 进程及其打开的 `db_storage` 句柄，自动定位自定义/迁移后的存储目录，区分在线与离线账号；各读取接口传入显式 `account` 参数时独立执行、不改写进程默认绑定状态，并按账号/游标分段加锁。
+- **紧凑型历史提取与关键词片段检索**：跨 `message_*.db` 分片合并查询，按分片独立 `Name2Id` 精确还原发送者，支持按 `chat_id` / 备注 / 昵称 / 群名模糊匹配，支持相对时间窗（如 `24h`、`7d`、`30m`）与 ISO/时间戳区间过滤。MCP 默认启用 `detail="compact"`、`max_text_chars=300`（`detail="full"` 不截断）与 `skip_noise=True`，检索自动返回围绕关键词的 `snippet`、`match_offset` 及 `est_tokens` 估算值；CLI 默认保持全字段输出（可用 `--compact` / `--skip-noise` 切换，支持导出 JSON / JSONL / CSV / Markdown）。
+- **服务端跨会话摘要与本地附件定位**：新增 `digest` 工具在服务端一次性聚合私聊/群聊消息统计、按小时/按天分布、`top_senders`、URL 外链、`@提及` 与高信号摘要；新增 `list_attachments` 解析群/私聊文件及转发聊天记录（`chat_history`）内嵌文件对应的本地明文路径，支持 Windows `(1)/(2)` 重名后缀与 MD5/文件大小置信度校验。
+- **至少一次（At-Least-Once）实时增量监控**：基于 SQLite `-wal` 增量帧合并与 `sort_seq` 组原子投递，各 `cursor_id` 独立持久化断点防重启漏消息；MCP 端 `poll_new_messages` / `wait_for_messages` 默认 `peek=True` 返回 `ack_token`，消费完成后调用 `ack_messages` 才推进持久化水位，防止 Agent 超时或压缩上下文时丢消息；CLI `watch` 与 Web UI SSE 保持连续自动提交。
+- **Agent 原生 MCP 接入**：内置标准 MCP Server，提供 12 个标注 `readOnlyHint=true` 的只读工具，同时支持 `stdio`（客户端拉起）与本机 `127.0.0.1` Streamable HTTP（可选 Bearer Token 鉴权）。
 - **极简本地 Web 控制台**：提供零外部 CDN、纯只读的单页控制台（`wx-observer ui`），支持切换在线账号、勾选要监控的私聊/群聊并实时滚动推送新消息。
 
 ---
@@ -28,30 +29,27 @@ sequenceDiagram
     autonumber
     participant Client as Agent / CLI / Web UI
     participant Svc as ObserverService
-    participant Disc as Discovery
-    participant Key as KeyStore & MemoryScanner
+    participant Disc as Discovery & KeyStore
     participant Pool as SQLCipher4 + WAL Pool
+    participant Reduce as Shaping / Digest / Attachments
     participant State as CursorStateStore
 
-    Client->>Svc: 请求账号列表或绑定账号
-    Svc->>Disc: 枚举 Weixin.exe 进程与打开的 db_storage 句柄
-    Disc-->>Svc: 返回在线账号 PID 与本地目录映射
-    Svc->>Key: 优先读取当前用户 DPAPI 缓存或外部 keys.json
-    alt 缺少有效密钥且账号在线
-        Key->>Key: 只读扫描 WCDB Config.Cipher 并校验页 1 HMAC
-        Key-->>Key: DPAPI 加密缓存至本地用户目录
-    end
-    Client->>Svc: 查询历史或启动实时监控 (cursor_id)
+    Client->>Svc: 请求账号列表或历史 / 摘要 / 附件 (可显式指定 account)
+    Svc->>Disc: 枚举 Weixin.exe 进程与本地目录，按 DPAPI 缓存或只读内存取密钥
+    Disc-->>Svc: 按账号加锁初始化并复用只读实例 (不覆盖默认账号)
     Svc->>Pool: 校验主库与 -wal 变更并增量合并至会话临时目录
-    Pool-->>Svc: 只读 sqlite3 查询、zstd 解压与跨分片发送者还原
-    Svc->>State: 原子读写该 cursor_id 的水位游标与过滤规则
-    State-->>Client: 返回结构化消息或 SSE/长轮询实时事件
+    Pool-->>Reduce: 返回原始消息、转发记录与文件元数据
+    Reduce-->>Client: 输出 compact/full 消息、snippet、est_tokens 或本地附件路径
+    Client->>Svc: poll_new_messages / wait_for_messages (MCP 默认 peek=True)
+    Svc-->>Client: 返回增量批次与 ack_token (此时尚未推进持久化水位)
+    Client->>Svc: ack_messages(cursor_id, ack_token)
+    Svc->>State: 原子提交该 cursor_id 的 sort_seq 水位断点
 ```
 
 1. **进程与目录发现**：通过 Win32 窗口/进程枚举及文件句柄映射，只读确认当前后台运行中的 `Weixin.exe` 所绑定的账号与真实数据路径。
 2. **只读密钥获取与缓存**：优先读取经 Windows DPAPI 按当前登录用户加密的本地缓存（或用户提供的 `--keys-file`）；缺失时通过只读 `ReadProcessMemory` 查找通用 WCDB 配置对象并经 SQLCipher 4 页 1 HMAC-SHA512 强校验，验证通过才使用。
-3. **临时解密与 WAL 增量合并**：将主库按页解密至独立会话临时目录，检测到 `-wal` 新增帧且 `wal_salt` 一致时仅做增量合并，并经 `PRAGMA quick_check` 校验完整性；程序退出时自动清理临时解密文件。
-4. **游标推进与多端输出**：各消费端通过独立 `cursor_id` 在本地 SQLite 中原子提交 `sort_seq` 水位，避免不同 Agent 或前端窗口互相覆盖进度。
+3. **临时解密、归约与附件定位**：将主库按页解密至独立会话临时目录，检测到 `-wal` 新增帧且 `wal_salt` 一致时仅做增量合并，并经 `PRAGMA quick_check` 校验完整性；服务端直接完成紧凑裁剪、跨群聚合与本地附件路径匹配，程序退出时自动清理临时解密文件。
+4. **安全游标推进与多端隔离**：MCP 客户端默认使用 `peek=True` 拉取新消息并凭 `ack_token` 调用 `ack_messages` 原子提交水位；`cursor_id` 之间互不覆盖，支持多账号并发访问。
 
 ---
 
@@ -129,6 +127,15 @@ python -m venv .venv
 
 # 实时监控新消息（JSONL 流式输出，默认不含自己发出的消息）
 .\.venv\Scripts\wx-observer.exe watch --mode all --interval 0.5 --jsonl
+
+# 紧凑模式读取历史（过滤表情/系统消息，查看 est_tokens）
+.\.venv\Scripts\wx-observer.exe history "产品研发群" --since 24h --compact --skip-noise --json
+
+# 生成最近 24 小时跨会话聚合摘要
+.\.venv\Scripts\wx-observer.exe digest --scope all --since 24h
+
+# 列出最近 7 天聊天与转发记录中的附件及其本地明文路径
+.\.venv\Scripts\wx-observer.exe attachments --since 7d --only-available
 ```
 
 ### 3. 启动极简实时监控 Web UI
@@ -167,14 +174,17 @@ python -m venv .venv
 | 工具名 | 作用说明 |
 | --- | --- |
 | `list_accounts` | 扫描后台 `Weixin.exe` 进程与本地账号目录，区分在线/离线与 PID |
-| `select_account` | 按 `account` 或 `pid` 绑定目标账号（支持传入外部 `keys_file`） |
-| `list_chats` | 列出私聊/群聊，支持 `chat_type` 与昵称/备注/群名模糊过滤 |
-| `get_messages` | 提取指定会话历史，支持 `before_seq`/`after_seq` 翻页、时间区间、发送者与类型筛选 |
-| `search_messages` | 按关键词检索指定会话或全库消息（含压缩长文） |
+| `select_account` | 按 `account` 或 `pid` 绑定默认目标账号（支持传入外部 `keys_file`；其他读取工具显式传 `account` 时互不覆盖） |
+| `list_chats` | 列出私聊/群聊，支持 `chat_type` 与昵称/备注/群名模糊过滤，附带 `est_tokens` |
+| `get_messages` | 提取指定会话历史，支持 `before_seq`/`after_seq` 翻页、相对/ISO 时间窗（`24h`/`7d`）、类型与发送者筛选；默认 `detail="compact"`（300 字符上限）与 `skip_noise=True`，可切 `detail="full"` |
+| `search_messages` | 按关键词检索指定会话或全库消息（含压缩长文），默认 `compact` 仅返回围绕匹配词的 `snippet` 与 `match_offset` |
+| `digest` | 服务端跨会话聚合摘要，按范围与时间窗输出计数、小时/天活跃桶、`top_senders`、URL 外链、附件、提及与精选高亮 |
+| `list_attachments` | 列出聊天文件与转发记录内嵌文件，并按路径安全边界、同名 `(1)` 后缀、文件大小与 MD5 解析本地明文路径 |
 | `configure_watch` | 为独立 `cursor_id` 配置监控范围（`all`/`private`/`group`/`allowlist`、排除列表、是否含自己） |
-| `poll_new_messages` | 非阻塞拉取某 `cursor_id` 自上次断点以来的增量新消息 |
-| `wait_for_messages` | 长轮询等待新消息（收到即返回，超时返回空列表，便于 Agent 持续监听） |
-| `get_status` | 查看当前绑定账号、解锁数据库数、监控过滤规则与游标状态 |
+| `poll_new_messages` | 非阻塞拉取 `cursor_id` 增量新消息；默认 `peek=True` 返回 `ack_token` 而不推进水位，`detail="compact"`、`skip_noise=True` |
+| `ack_messages` | 使用 `poll_new_messages` / `wait_for_messages` 返回的 `ack_token`（及可选 `upto`）原子提交该 `cursor_id` 水位 |
+| `wait_for_messages` | 长轮询等待新消息（收到即返回，超时返回空列表）；默认 `peek=True` 与 `detail="compact"` |
+| `get_status` | 查看目标账号状态、解锁数据库数、监控过滤规则与游标进度 |
 
 ---
 

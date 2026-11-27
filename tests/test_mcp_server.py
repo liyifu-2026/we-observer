@@ -35,8 +35,12 @@ def _extract_json_result(call_result) -> dict:
     raise AssertionError(f"Empty tool result: {call_result}")
 
 
-def test_mcp_all_9_tools_over_memory_transport(tmp_path) -> None:
+def test_mcp_all_12_tools_over_memory_transport(tmp_path) -> None:
     env = SyntheticAccountEnv(tmp_path / "wx")
+    file_dir = env.db_dir / env.account_id / "msg" / "file" / time.strftime("%Y-%m")
+    file_dir.mkdir(parents=True, exist_ok=True)
+    (file_dir / "spec.pdf").write_bytes(b"P" * 12345)
+
     temp_root = tmp_path / "pool_tmp"
     service = ObserverService(
         db_dir=str(env.db_dir),
@@ -56,8 +60,11 @@ def test_mcp_all_9_tools_over_memory_transport(tmp_path) -> None:
                 "list_chats",
                 "get_messages",
                 "search_messages",
+                "digest",
+                "list_attachments",
                 "configure_watch",
                 "poll_new_messages",
+                "ack_messages",
                 "wait_for_messages",
                 "get_status",
             }
@@ -75,16 +82,44 @@ def test_mcp_all_9_tools_over_memory_transport(tmp_path) -> None:
 
             chats_res = _extract_json_result(await client.call_tool("list_chats", {}))
             assert chats_res["count"] == 2
+            assert chats_res["est_tokens"] > 0
 
+            # Default MCP output is compact
             msgs_res = _extract_json_result(
                 await client.call_tool("get_messages", {"chat": "AliceRemark", "limit": 10})
             )
+            assert msgs_res["detail"] == "compact"
             assert msgs_res["count"] == 5
+            assert msgs_res["est_tokens"] > 0
+            assert "t" in msgs_res["messages"][0]
+            assert "seq" in msgs_res["messages"][0]
+
+            full_res = _extract_json_result(
+                await client.call_tool("get_messages", {"chat": "AliceRemark", "limit": 10, "detail": "full"})
+            )
+            assert full_res["detail"] == "full"
+            assert "sort_seq" in full_res["messages"][0]
 
             search_res = _extract_json_result(
                 await client.call_tool("search_messages", {"keyword": "中文测试"})
             )
             assert search_res["count"] == 1
+            assert search_res["detail"] == "compact"
+            assert search_res["est_tokens"] > 0
+
+            digest_res = _extract_json_result(
+                await client.call_tool("digest", {"scope": "all", "since": "24h"})
+            )
+            assert digest_res["ok"] is True
+            assert digest_res["summary"]["total_messages"] >= 9
+            assert any(att["filename"] == "spec.pdf" and att["available"] for att in digest_res["attachments"])
+
+            attach_res = _extract_json_result(
+                await client.call_tool("list_attachments", {"scope": "all", "since": "7d"})
+            )
+            assert attach_res["ok"] is True
+            assert attach_res["available_count"] >= 1
+            assert attach_res["attachments"][0]["filename"] == "spec.pdf"
 
             cfg_res = _extract_json_result(
                 await client.call_tool(
@@ -100,7 +135,7 @@ def test_mcp_all_9_tools_over_memory_transport(tmp_path) -> None:
             )
             assert poll1["initialized"] is True and poll1["count"] == 0
 
-            # Append WAL row and wake wait_for_messages
+            # Append WAL row and wake wait_for_messages (defaults to peek=True)
             env.append_wal_messages(
                 env.alice_id,
                 [(40, 1, 999, 3, int(time.time()), "MCP live message")],
@@ -112,7 +147,29 @@ def test_mcp_all_9_tools_over_memory_transport(tmp_path) -> None:
                 )
             )
             assert waited["timed_out"] is False
+            assert waited["peek"] is True
+            assert waited["ack_token"]
             assert waited["messages"][0]["text"] == "MCP live message"
+
+            # Un-acked batch is still re-delivered on subsequent peek
+            redeliver = _extract_json_result(
+                await client.call_tool("poll_new_messages", {"cursor_id": "mcp-test"})
+            )
+            assert redeliver["count"] == 1
+
+            # Explicit ack commits watermark
+            ack_res = _extract_json_result(
+                await client.call_tool(
+                    "ack_messages",
+                    {"cursor_id": "mcp-test", "ack_token": waited["ack_token"]},
+                )
+            )
+            assert ack_res["ok"] is True and ack_res["committed"] == {env.alice_id: 999}
+
+            after_ack = _extract_json_result(
+                await client.call_tool("poll_new_messages", {"cursor_id": "mcp-test"})
+            )
+            assert after_ack["count"] == 0
 
             status = _extract_json_result(
                 await client.call_tool("get_status", {"cursor_id": "mcp-test"})
@@ -167,7 +224,7 @@ def test_mcp_streamable_http_bearer_auth_and_tool_call(tmp_path) -> None:
                     async with ClientSession(read_s, write_s) as session:
                         await session.initialize()
                         tools = await session.list_tools()
-                        assert len(tools.tools) == 9
+                        assert len(tools.tools) == 12
                         sel = _extract_json_result(
                             await session.call_tool("select_account", {"account": env.account_id})
                         )

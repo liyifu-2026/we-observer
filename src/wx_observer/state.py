@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+import uuid
 from pathlib import Path
 
+from wx_observer.exceptions import WxObserverError
 from wx_observer.key_store import default_state_dir
 from wx_observer.models import WatchFilter
 
@@ -56,6 +58,17 @@ class CursorStateStore:
                         last_sort_seq INTEGER NOT NULL,
                         updated_at INTEGER NOT NULL,
                         PRIMARY KEY (account_id, cursor_id, chat_id)
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS pending_acks (
+                        ack_token TEXT PRIMARY KEY,
+                        account_id TEXT NOT NULL,
+                        cursor_id TEXT NOT NULL,
+                        watermarks_json TEXT NOT NULL,
+                        created_at INTEGER NOT NULL
                     )
                     """
                 )
@@ -189,14 +202,103 @@ class CursorStateStore:
         finally:
             conn.close()
 
+    def save_pending_ack(
+        self,
+        account_id: str,
+        cursor_id: str,
+        updates: dict[str, int],
+    ) -> str:
+        """Persist a pending watermark batch and return an opaque ack_token."""
+        now = int(time.time())
+        token = uuid.uuid4().hex
+        payload = json.dumps({str(k): int(v) for k, v in updates.items()}, ensure_ascii=False)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "DELETE FROM pending_acks WHERE created_at < ?",
+                (now - 86400,),
+            )
+            conn.execute(
+                """
+                INSERT INTO pending_acks (ack_token, account_id, cursor_id, watermarks_json, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (token, account_id, cursor_id, payload, now),
+            )
+            conn.commit()
+            return token
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def apply_pending_ack(
+        self,
+        account_id: str,
+        cursor_id: str,
+        ack_token: str,
+    ) -> dict[str, int]:
+        """Atomically commit watermarks referenced by ack_token for (account_id, cursor_id)."""
+        now = int(time.time())
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT watermarks_json, created_at
+                FROM pending_acks
+                WHERE ack_token = ? AND account_id = ? AND cursor_id = ?
+                """,
+                (ack_token, account_id, cursor_id),
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                raise WxObserverError(
+                    "invalid_ack_token",
+                    f"Ack token '{ack_token}' was not found or does not belong to cursor '{cursor_id}'.",
+                    {"account_id": account_id, "cursor_id": cursor_id},
+                )
+            raw_map = json.loads(row["watermarks_json"] or "{}")
+            updates = {str(k): int(v) for k, v in raw_map.items()}
+            for chat_id, seq in updates.items():
+                conn.execute(
+                    """
+                    INSERT INTO chat_watermarks (
+                        account_id, cursor_id, chat_id, last_sort_seq, updated_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(account_id, cursor_id, chat_id) DO UPDATE SET
+                        last_sort_seq = MAX(chat_watermarks.last_sort_seq, excluded.last_sort_seq),
+                        updated_at = excluded.updated_at
+                    """,
+                    (account_id, cursor_id, chat_id, int(seq), now),
+                )
+            conn.execute(
+                "DELETE FROM pending_acks WHERE ack_token = ?",
+                (ack_token,),
+            )
+            conn.commit()
+            return updates
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def reset_cursor(self, account_id: str, cursor_id: str = "default") -> None:
-        """Clear watermarks and baseline initialization for one cursor only."""
+        """Clear watermarks, pending acks, and baseline initialization for one cursor only."""
         now = int(time.time())
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 "DELETE FROM chat_watermarks WHERE account_id = ? AND cursor_id = ?",
+                (account_id, cursor_id),
+            )
+            conn.execute(
+                "DELETE FROM pending_acks WHERE account_id = ? AND cursor_id = ?",
                 (account_id, cursor_id),
             )
             conn.execute(

@@ -45,20 +45,29 @@ async def _exec_tool(fn: Callable[..., dict[str, Any]], /, *args: Any, **kwargs:
         }
 
 
+def _resolve_max_chars(detail: str, max_text_chars: int | None) -> int | None:
+    if max_text_chars is None:
+        return 300 if detail == "compact" else None
+    if max_text_chars <= 0:
+        return None
+    return int(max_text_chars)
+
+
 def create_mcp_server(
     service: ObserverService,
     *,
     name: str = "wx-observer",
 ) -> MCPServer:
-    """Create a read-only MCPServer exposing account discovery, history extraction, and live watching."""
+    """Create a read-only MCPServer exposing account discovery, history, digests, attachments, and live watching."""
     server = MCPServer(
         name=name,
-        version="0.1.0",
+        version="0.2.0",
         instructions=(
             "Read-only Windows WeChat 4.x local observer. "
-            "Use list_accounts and select_account to choose a running account, "
-            "list_chats/get_messages/search_messages to inspect history, and "
-            "configure_watch + poll_new_messages or wait_for_messages for real-time monitoring."
+            "Use list_accounts and select_account (or pass explicit account='...' per call without mutating global state). "
+            "Use digest for quick cross-chat summaries, list_attachments to resolve downloaded local file paths, "
+            "and list_chats/get_messages/search_messages to inspect history (default detail='compact' with 300-char limit, skip_noise=True, and est_tokens; pass detail='full' for raw fields). "
+            "Use configure_watch + poll_new_messages/wait_for_messages (default peek=True returning ack_token) followed by ack_messages to advance cursors reliably."
         ),
         log_level="WARNING",
     )
@@ -113,7 +122,8 @@ def create_mcp_server(
         name="get_messages",
         description=(
             "Extract historical messages from a private or group chat (by chat_id, remark, nickname, or group name). "
-            "Supports pagination (before_seq/after_seq), ISO/epoch time range (since/until), type, sender, and keyword filters."
+            "Supports pagination (before_seq/after_seq), relative/ISO/epoch time range (since/until e.g. '24h', '7d'), type, sender, and keyword filters. "
+            "Defaults to detail='compact' (300-char cap unless max_text_chars is set; 0 disables truncation), skip_noise=True, and est_tokens."
         ),
         annotations=_READONLY_TOOL,
     )
@@ -128,6 +138,9 @@ def create_mcp_server(
         sender: str | None = None,
         keyword: str | None = None,
         include_self: bool = True,
+        detail: Literal["compact", "full"] = "compact",
+        max_text_chars: int | None = None,
+        skip_noise: bool = True,
         account: str | None = None,
     ) -> dict[str, Any]:
         return await _exec_tool(
@@ -142,12 +155,18 @@ def create_mcp_server(
             sender=sender,
             keyword=keyword,
             include_self=include_self,
+            detail=detail,
+            max_text_chars=_resolve_max_chars(detail, max_text_chars),
+            skip_noise=skip_noise,
             account=account,
         )
 
     @server.tool(
         name="search_messages",
-        description="Search historical messages by keyword across a specific chat or across private/group chats.",
+        description=(
+            "Search historical messages by keyword across a specific chat or across private/group chats. "
+            "In compact mode (default), returns keyword-centered snippets, match_offset, and est_tokens."
+        ),
         annotations=_READONLY_TOOL,
     )
     async def search_messages(
@@ -157,6 +176,9 @@ def create_mcp_server(
         since: str | None = None,
         until: str | None = None,
         limit: int = 50,
+        detail: Literal["compact", "full"] = "compact",
+        max_text_chars: int | None = None,
+        skip_noise: bool = True,
         account: str | None = None,
     ) -> dict[str, Any]:
         return await _exec_tool(
@@ -167,6 +189,9 @@ def create_mcp_server(
             since=since,
             until=until,
             limit=limit,
+            detail=detail,
+            max_text_chars=_resolve_max_chars(detail, max_text_chars),
+            skip_noise=skip_noise,
             account=account,
         )
 
@@ -203,20 +228,50 @@ def create_mcp_server(
     @server.tool(
         name="poll_new_messages",
         description=(
-            "Non-blocking poll for newly arrived messages since the last persisted watermark for cursor_id. "
-            "First call establishes baseline from the latest message and returns empty."
+            "Non-blocking poll for newly arrived messages since the persisted watermark for cursor_id. "
+            "Defaults to peek=True (returns ack_token without advancing watermark until ack_messages is called) and detail='compact'."
         ),
         annotations=_POLL_TOOL,
     )
     async def poll_new_messages(
         cursor_id: str = "default",
         limit: int = 100,
+        peek: bool = True,
+        detail: Literal["compact", "full"] = "compact",
+        max_text_chars: int | None = None,
+        skip_noise: bool = True,
         account: str | None = None,
     ) -> dict[str, Any]:
         return await _exec_tool(
             service.poll_new_messages,
             cursor_id=cursor_id,
             limit=limit,
+            peek=peek,
+            detail=detail,
+            max_text_chars=_resolve_max_chars(detail, max_text_chars),
+            skip_noise=skip_noise,
+            account=account,
+        )
+
+    @server.tool(
+        name="ack_messages",
+        description=(
+            "Commit persisted read watermarks returned by poll_new_messages or wait_for_messages when peek=True. "
+            "Pass ack_token from the poll response, and optionally upto={chat_id: max_sort_seq} for partial acknowledgment."
+        ),
+        annotations=_POLL_TOOL,
+    )
+    async def ack_messages(
+        cursor_id: str = "default",
+        ack_token: str | None = None,
+        upto: dict[str, int] | None = None,
+        account: str | None = None,
+    ) -> dict[str, Any]:
+        return await _exec_tool(
+            service.ack_messages,
+            cursor_id=cursor_id,
+            ack_token=ack_token,
+            upto=upto,
             account=account,
         )
 
@@ -224,7 +279,7 @@ def create_mcp_server(
         name="wait_for_messages",
         description=(
             "Long-poll for newly arrived messages for cursor_id; returns immediately when new messages arrive "
-            "or returns an empty list after timeout_seconds."
+            "or returns empty after timeout_seconds. Defaults to peek=True (issues ack_token) and detail='compact'."
         ),
         annotations=_POLL_TOOL,
     )
@@ -233,6 +288,10 @@ def create_mcp_server(
         timeout_seconds: float = 25.0,
         poll_interval: float = 1.0,
         limit: int = 100,
+        peek: bool = True,
+        detail: Literal["compact", "full"] = "compact",
+        max_text_chars: int | None = None,
+        skip_noise: bool = True,
         account: str | None = None,
     ) -> dict[str, Any]:
         return await _exec_tool(
@@ -240,6 +299,74 @@ def create_mcp_server(
             cursor_id=cursor_id,
             timeout_seconds=timeout_seconds,
             poll_interval=poll_interval,
+            limit=limit,
+            peek=peek,
+            detail=detail,
+            max_text_chars=_resolve_max_chars(detail, max_text_chars),
+            skip_noise=skip_noise,
+            account=account,
+        )
+
+    @server.tool(
+        name="digest",
+        description=(
+            "Build a compact server-side cross-chat digest over a time window (e.g. since='24h', '7d', '30m'). "
+            "Reduces multiple chats into per-chat counts, hourly/daily buckets, top_senders, links, attachments, @mentions, and highlights."
+        ),
+        annotations=_READONLY_TOOL,
+    )
+    async def digest(
+        scope: Literal["all", "private", "group"] = "all",
+        chats: list[str] | None = None,
+        since: str = "24h",
+        until: str | None = None,
+        buckets: Literal["hour", "day", "none"] = "hour",
+        include: list[Literal["counts", "top_senders", "links", "attachments", "mentions", "highlights"]] | None = None,
+        max_highlights_per_chat: int = 8,
+        max_text_chars: int = 160,
+        include_self: bool = True,
+        account: str | None = None,
+    ) -> dict[str, Any]:
+        return await _exec_tool(
+            service.digest,
+            scope=scope,
+            chats=chats,
+            since=since,
+            until=until,
+            buckets=buckets,
+            include=include,
+            max_highlights_per_chat=max_highlights_per_chat,
+            max_text_chars=max_text_chars,
+            include_self=include_self,
+            account=account,
+        )
+
+    @server.tool(
+        name="list_attachments",
+        description=(
+            "List file attachments shared across chats (including forwarded chat-history embedded files) "
+            "and resolve local WeChat plaintext file paths with size/MD5 confidence metadata."
+        ),
+        annotations=_READONLY_TOOL,
+    )
+    async def list_attachments(
+        scope: Literal["all", "private", "group"] = "all",
+        chats: list[str] | None = None,
+        since: str = "7d",
+        until: str | None = None,
+        extensions: list[str] | None = None,
+        only_available: bool = False,
+        limit: int = 50,
+        account: str | None = None,
+    ) -> dict[str, Any]:
+        return await _exec_tool(
+            service.list_attachments,
+            scope=scope,
+            chats=chats,
+            since=since,
+            until=until,
+            extensions=extensions,
+            only_available=only_available,
             limit=limit,
             account=account,
         )

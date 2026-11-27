@@ -1,0 +1,281 @@
+"""Server-side cross-chat digest and reduction for token-efficient Agent consumption."""
+
+from __future__ import annotations
+
+import re
+from collections import Counter, defaultdict
+from datetime import datetime
+from typing import Any
+
+from wx_observer.attachments import build_file_index, resolve_local_file
+from wx_observer.models import MessageEvent
+from wx_observer.shaping import (
+    estimate_tokens,
+    format_compact_time,
+    is_noise_message,
+    shape_message,
+)
+
+ALL_DIGEST_SECTIONS = frozenset(
+    {"counts", "top_senders", "links", "attachments", "mentions", "highlights"}
+)
+_URL_RE = re.compile(r"https?://[^\s<>\"'\])]+")
+_MENTION_RE = re.compile(r"(?:^|(?<=[\s,，。:：;；!！?？(（\[【]))@([^\s@\u2005]{1,40})")
+
+
+def _bucket_label(ts: int, buckets: str) -> str:
+    if ts <= 0 or buckets == "none":
+        return ""
+    try:
+        dt = datetime.fromtimestamp(ts)
+        if buckets == "day":
+            return dt.strftime("%Y-%m-%d")
+        return dt.strftime("%m-%d %H:00")
+    except (OSError, OverflowError, ValueError):
+        return ""
+
+
+def _highlight_score(ev: MessageEvent) -> tuple[int, int, int]:
+    priority = 1
+    if ev.msg_type in ("file", "link", "chat_history"):
+        priority = 4
+    elif ev.quote is not None or "@" in (ev.text or ""):
+        priority = 3
+    elif ev.msg_type == "text" and len(ev.text or "") >= 15:
+        priority = 2
+    return (priority, len(ev.text or ""), ev.timestamp)
+
+
+def build_digest(
+    repo: Any,
+    *,
+    scope: str = "all",
+    chats: list[str] | None = None,
+    since_ts: int | None = None,
+    until_ts: int | None = None,
+    buckets: str = "hour",
+    include: list[str] | None = None,
+    max_highlights_per_chat: int = 8,
+    max_text_chars: int = 160,
+    include_self: bool = True,
+) -> dict[str, Any]:
+    """Aggregate messages across chats into a structured, token-budgeted digest."""
+    if buckets not in ("hour", "day", "none"):
+        raise ValueError(f"Unsupported buckets mode: {buckets}")
+
+    sections = (
+        {s.strip().lower() for s in include if s and s.strip()}
+        if include
+        else set(ALL_DIGEST_SECTIONS)
+    )
+
+    explicit_chats = bool(chats)
+    if chats:
+        target_chats = [repo.resolve_chat(ref) for ref in chats]
+    else:
+        chat_type = scope if scope in ("private", "group") else "all"
+        target_chats = repo.list_chats(
+            chat_type=chat_type,
+            limit=10_000,
+            include_hidden=True,
+            include_non_session=(since_ts is None),
+        )
+
+    file_index = build_file_index(repo.account.data_dir) if "attachments" in sections else None
+    per_chat_out: list[dict[str, Any]] = []
+    global_senders: Counter[str] = Counter()
+    links_out: list[dict[str, Any]] = []
+    seen_links: set[tuple[str, str]] = set()
+    attachments_out: list[dict[str, Any]] = []
+    mentions_out: list[dict[str, Any]] = []
+
+    total_messages = 0
+    total_noise = 0
+    active_chats = 0
+
+    for chat in target_chats:
+        if (
+            not explicit_chats
+            and since_ts is not None
+            and (chat.last_timestamp <= 0 or chat.last_timestamp < since_ts - 60)
+        ):
+            continue
+
+        res = repo.get_messages(
+            chat.chat_id,
+            chat_name=chat.display_name,
+            limit=1000,
+            since_ts=since_ts,
+            until_ts=until_ts,
+            include_self=include_self,
+        )
+        msgs: list[MessageEvent] = res["messages"]
+        if not msgs:
+            continue
+
+        active_chats += 1
+        chat_senders: Counter[str] = Counter()
+        chat_buckets: dict[str, int] = defaultdict(int)
+        chat_type_counts: Counter[str] = Counter()
+        signal_msgs: list[MessageEvent] = []
+        chat_noise = 0
+
+        for ev in msgs:
+            total_messages += 1
+            chat_type_counts[ev.msg_type] += 1
+            sender_label = ev.sender_name or ev.sender_id or ("我" if ev.is_self else "未知")
+            if is_noise_message(ev):
+                chat_noise += 1
+                total_noise += 1
+                continue
+
+            signal_msgs.append(ev)
+            chat_senders[sender_label] += 1
+            global_senders[sender_label] += 1
+
+            b_key = _bucket_label(ev.timestamp, buckets)
+            if b_key:
+                chat_buckets[b_key] += 1
+
+            if "links" in sections:
+                urls: list[tuple[str, str]] = []
+                if ev.msg_type == "link" and ev.metadata.get("url"):
+                    urls.append((str(ev.metadata["url"]), str(ev.metadata.get("title") or "")))
+                for raw_u in _URL_RE.findall(ev.text or ""):
+                    urls.append((raw_u.rstrip(".,;:!?"), ""))
+                for url_val, title_val in urls:
+                    dedup = (chat.chat_id, url_val)
+                    if dedup not in seen_links:
+                        seen_links.add(dedup)
+                        links_out.append(
+                            {
+                                "url": url_val,
+                                "title": title_val or None,
+                                "chat": chat.display_name,
+                                "chat_id": chat.chat_id,
+                                "sender": sender_label,
+                                "t": format_compact_time(ev.timestamp, ev.iso_time),
+                                "seq": ev.sort_seq,
+                            }
+                        )
+
+            if "attachments" in sections:
+                emb_items: list[dict[str, Any]] = []
+                if ev.msg_type == "file" and ev.metadata.get("filename"):
+                    emb_items.append(
+                        {
+                            "filename": ev.metadata["filename"],
+                            "size_bytes": ev.metadata.get("size_bytes"),
+                            "file_ext": ev.metadata.get("file_ext") or "",
+                            "md5": ev.metadata.get("md5"),
+                        }
+                    )
+                elif ev.msg_type == "chat_history":
+                    emb_items.extend(ev.metadata.get("embedded_files") or ())
+                for item in emb_items:
+                    fname = str(item.get("filename") or "").strip()
+                    if not fname:
+                        continue
+                    resolved = resolve_local_file(
+                        repo.account.data_dir,
+                        fname,
+                        ev.timestamp,
+                        expected_size=item.get("size_bytes"),
+                        expected_md5=item.get("md5"),
+                        file_ext=str(item.get("file_ext") or ""),
+                        file_index=file_index,
+                    )
+                    attachments_out.append(
+                        {
+                            "filename": fname,
+                            "size_bytes": item.get("size_bytes") or resolved.get("actual_size_bytes"),
+                            "available": resolved["available"],
+                            "local_path": resolved["local_path"],
+                            "chat": chat.display_name,
+                            "chat_id": chat.chat_id,
+                            "sender": sender_label,
+                            "t": format_compact_time(ev.timestamp, ev.iso_time),
+                            "seq": ev.sort_seq,
+                        }
+                    )
+
+            if "mentions" in sections and ev.text:
+                found_mentions = _MENTION_RE.findall(ev.text)
+                if found_mentions:
+                    mentions_out.append(
+                        {
+                            "targets": list(dict.fromkeys(found_mentions)),
+                            "chat": chat.display_name,
+                            "chat_id": chat.chat_id,
+                            "sender": sender_label,
+                            "t": format_compact_time(ev.timestamp, ev.iso_time),
+                            "text": ev.text[:max_text_chars],
+                            "seq": ev.sort_seq,
+                        }
+                    )
+
+        chat_entry: dict[str, Any] = {
+            "chat_id": chat.chat_id,
+            "chat": chat.display_name,
+            "chat_type": chat.chat_type,
+            "total": len(msgs),
+            "signal_count": len(signal_msgs),
+            "noise_count": chat_noise,
+        }
+        if "counts" in sections:
+            chat_entry["by_type"] = dict(chat_type_counts)
+            if buckets != "none" and chat_buckets:
+                chat_entry["buckets"] = dict(sorted(chat_buckets.items()))
+        if "top_senders" in sections:
+            chat_entry["top_senders"] = [
+                {"sender": name, "count": cnt} for name, cnt in chat_senders.most_common(5)
+            ]
+        if "highlights" in sections and signal_msgs:
+            ranked = sorted(signal_msgs, key=_highlight_score, reverse=True)[:max_highlights_per_chat]
+            ranked.sort(key=lambda e: (e.timestamp, e.sort_seq, e.local_id))
+            chat_entry["highlights"] = [
+                shape_message(
+                    ev,
+                    detail="compact",
+                    max_text_chars=max_text_chars,
+                    include_chat=False,
+                )
+                for ev in ranked
+            ]
+        per_chat_out.append(chat_entry)
+
+    per_chat_out.sort(key=lambda c: c["signal_count"], reverse=True)
+
+    result: dict[str, Any] = {
+        "ok": True,
+        "account_id": repo.account.account_id,
+        "window": {
+            "since_ts": since_ts,
+            "until_ts": until_ts,
+            "scope": scope,
+            "buckets": buckets,
+        },
+        "summary": {
+            "active_chats": active_chats,
+            "total_messages": total_messages,
+            "signal_messages": total_messages - total_noise,
+            "noise_messages": total_noise,
+            "links_count": len(links_out),
+            "attachments_count": len(attachments_out),
+            "mentions_count": len(mentions_out),
+        },
+        "per_chat": per_chat_out,
+    }
+    if "top_senders" in sections:
+        result["top_senders"] = [
+            {"sender": name, "count": cnt} for name, cnt in global_senders.most_common(10)
+        ]
+    if "links" in sections:
+        result["links"] = links_out[:100]
+    if "attachments" in sections:
+        result["attachments"] = attachments_out[:100]
+    if "mentions" in sections:
+        result["mentions"] = mentions_out[:100]
+
+    result["est_tokens"] = estimate_tokens(result)
+    return result

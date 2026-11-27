@@ -249,6 +249,9 @@ def create_web_ui_app(
                     lambda: service.poll_new_messages(
                         cursor_id=cursor_id,
                         limit=100,
+                        peek=False,
+                        detail="full",
+                        skip_noise=False,
                         account=account,
                     )
                 )
@@ -278,6 +281,9 @@ def create_web_ui_app(
                         lambda: service.poll_new_messages(
                             cursor_id=cursor_id,
                             limit=100,
+                            peek=False,
+                            detail="full",
+                            skip_noise=False,
                             account=account,
                         )
                     )

@@ -6,6 +6,7 @@ import hashlib
 import os
 import re
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,33 @@ from wx_observer.models import AccountInfo, ChatInfo, ChatType, MessageEvent
 from wx_observer.parser import parse_message_row
 
 _MESSAGE_SHARD_RE = re.compile(r"^(?:message/)?message_(\d+)\.db$", re.I)
+_MSG_TYPE_TO_BASE_TYPES: dict[str, tuple[int, ...]] = {
+    "text": (1, 49),
+    "image": (3,),
+    "voice": (34,),
+    "video": (43,),
+    "emoji": (47, 11000),
+    "location": (48,),
+    "file": (49,),
+    "link": (49,),
+    "miniprogram": (49,),
+    "chat_history": (49,),
+    "transfer": (49,),
+    "red_packet": (49,),
+    "card": (49,),
+    "quote": (49,),
+    "voip": (50,),
+    "system": (10000,),
+}
+_APPMSG_TYPE_TO_SUBTYPES: dict[str, tuple[int, ...]] = {
+    "file": (6,),
+    "chat_history": (19,),
+    "link": (5,),
+    "quote": (57,),
+    "miniprogram": (33, 36),
+    "transfer": (2000,),
+    "red_packet": (2001,),
+}
 
 
 def _is_malformed_error(exc: sqlite3.DatabaseError) -> bool:
@@ -73,7 +101,10 @@ class AccountRepository:
         self._last_msg_dir_listing: tuple[str, ...] = ()
         self._contacts_mtime: tuple[int, int] = (-1, -1)
         self._contacts_cache: dict[str, dict[str, str]] = {}
+        self._cache_lock = threading.RLock()
         self._table_cols_cache: dict[tuple[str, str], set[str]] = {}
+        self._shard_tables_cache: dict[str, tuple[tuple[int, int, int, int], frozenset[str]]] = {}
+        self._name2id_cache: dict[str, tuple[tuple[int, int, int, int], dict[int, str]]] = {}
         self._own_wxid_cache: str | None = None
 
         self._refresh_db_inventory(force=True)
@@ -209,6 +240,33 @@ class AccountRepository:
         shards.sort(key=lambda item: (item[0], item[1]))
         return [rel for _, rel in shards]
 
+    def _invalidate_caches(self) -> None:
+        with self._cache_lock:
+            self._shard_tables_cache.clear()
+            self._name2id_cache.clear()
+            self._table_cols_cache.clear()
+
+    def _invalidate_all(self) -> None:
+        self.pool.invalidate_all()
+        self._invalidate_caches()
+
+    def _single_db_fingerprint(self, rel: str) -> tuple[int, int, int, int]:
+        path = self._db_files.get(rel)
+        if path is None:
+            return (0, 0, 0, 0)
+        try:
+            st = path.stat()
+            db_m, db_s = st.st_mtime_ns, st.st_size
+        except OSError:
+            db_m, db_s = 0, 0
+        wal = Path(str(path) + "-wal")
+        try:
+            wst = wal.stat()
+            wal_m, wal_s = wst.st_mtime_ns, wst.st_size
+        except OSError:
+            wal_m, wal_s = 0, 0
+        return (db_m, db_s, wal_m, wal_s)
+
     def get_shard_fingerprints(self) -> dict[str, tuple[int, int, int, int]]:
         """Return cheap (mtime_ns, size, wal_mtime_ns, wal_size) stats for shards + session DB."""
         self._ensure_shards_up_to_date()
@@ -219,36 +277,43 @@ class AccountRepository:
 
         stats: dict[str, tuple[int, int, int, int]] = {}
         for rel in rels:
-            path = self._db_files.get(rel)
-            if path is None:
-                continue
-            try:
-                st = path.stat()
-                db_m, db_s = st.st_mtime_ns, st.st_size
-            except OSError:
-                db_m, db_s = 0, 0
-            wal = Path(str(path) + "-wal")
-            try:
-                wst = wal.stat()
-                wal_m, wal_s = wst.st_mtime_ns, wst.st_size
-            except OSError:
-                wal_m, wal_s = 0, 0
-            stats[rel] = (db_m, db_s, wal_m, wal_s)
+            if rel in self._db_files:
+                stats[rel] = self._single_db_fingerprint(rel)
         return stats
+
+    def _get_shard_tables(self, rel: str, *, force_rebuild: bool = False) -> frozenset[str]:
+        fp = self._single_db_fingerprint(rel)
+        with self._cache_lock:
+            cached = self._shard_tables_cache.get(rel)
+            if not force_rebuild and cached is not None and cached[0] == fp:
+                return cached[1]
+        conn = self.pool.open_readonly(rel, force_rebuild=force_rebuild)
+        try:
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'"
+            ).fetchall()
+            tables = frozenset(str(r[0]) for r in rows if r[0])
+        finally:
+            conn.close()
+        with self._cache_lock:
+            self._shard_tables_cache[rel] = (fp, tables)
+        return tables
 
     def _open_with_recovery(self, rel: str) -> sqlite3.Connection:
         return self.pool.open_readonly(rel)
 
     def _table_columns(self, conn: sqlite3.Connection, shard: str, table: str) -> set[str]:
         key = (shard, table)
-        cached = self._table_cols_cache.get(key)
+        with self._cache_lock:
+            cached = self._table_cols_cache.get(key)
         if cached is not None:
             return cached
         cols = {
             str(row["name"])
             for row in conn.execute(f'PRAGMA table_info("{table}")').fetchall()
         }
-        self._table_cols_cache[key] = cols
+        with self._cache_lock:
+            self._table_cols_cache[key] = cols
         return cols
 
     def _load_contacts(self, force: bool = False) -> dict[str, dict[str, str]]:
@@ -297,7 +362,7 @@ class AccountRepository:
                 return cache
             except sqlite3.DatabaseError as exc:
                 if attempt == 0 and _is_malformed_error(exc):
-                    self.pool.invalidate_all()
+                    self._invalidate_all()
                     continue
                 return self._contacts_cache
             finally:
@@ -339,6 +404,7 @@ class AccountRepository:
         query: str | None = None,
         limit: int = 50,
         include_hidden: bool = False,
+        include_non_session: bool | None = None,
     ) -> list[ChatInfo]:
         contacts = self._load_contacts()
         session_rel = self._find_rel_by_basename("session.db")
@@ -392,14 +458,15 @@ class AccountRepository:
                     break
                 except sqlite3.DatabaseError as exc:
                     if attempt == 0 and _is_malformed_error(exc):
-                        self.pool.invalidate_all()
+                        self._invalidate_all()
                         continue
                     raise
                 finally:
                     conn.close()
 
         # Also surface known contacts/groups that may have Msg_ tables even if not in active sessions
-        if include_hidden or not chats:
+        append_contacts = include_hidden if include_non_session is None else include_non_session
+        if append_contacts or not chats:
             for uname, cinfo in contacts.items():
                 if uname in seen_ids:
                     continue
@@ -490,44 +557,51 @@ class AccountRepository:
             return []
 
         for attempt in (0, 1):
-            conns: list[tuple[sqlite3.Connection, str]] = []
+            force_rebuild = attempt == 1
             matched: list[tuple[sqlite3.Connection, str, str]] = []
             try:
-                for rel in shard_rels:
-                    conn = self.pool.open_readonly(rel, force_rebuild=(attempt == 1))
-                    conns.append((conn, rel))
-                    row = conn.execute(
-                        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-                        (table,),
-                    ).fetchone()
-                    if row is not None:
-                        matched.append((conn, rel, table))
-                keep = {id(c) for c, _, _ in matched}
-                for conn, _ in conns:
-                    if id(conn) not in keep:
-                        conn.close()
+                matching_rels = [
+                    rel
+                    for rel in shard_rels
+                    if table in self._get_shard_tables(rel, force_rebuild=force_rebuild)
+                ]
+                if not matching_rels:
+                    return []
+                for rel in matching_rels:
+                    conn = self.pool.open_readonly(rel, force_rebuild=force_rebuild)
+                    matched.append((conn, rel, table))
                 return matched
             except sqlite3.DatabaseError as exc:
-                for conn, _ in conns:
+                for conn, _, _ in matched:
                     conn.close()
                 if attempt == 0 and _is_malformed_error(exc):
-                    self.pool.invalidate_all()
+                    self._invalidate_all()
                     continue
                 raise
             except Exception:
-                for conn, _ in conns:
+                for conn, _, _ in matched:
                     conn.close()
                 raise
         return []
 
-    def _load_shard_name2id(self, conn: sqlite3.Connection) -> dict[int, str]:
+    def _load_shard_name2id(self, conn: sqlite3.Connection, rel: str | None = None) -> dict[int, str]:
+        fp = self._single_db_fingerprint(rel) if rel else None
+        if rel and fp is not None:
+            with self._cache_lock:
+                cached = self._name2id_cache.get(rel)
+                if cached is not None and cached[0] == fp:
+                    return cached[1]
         try:
-            return {
+            mapping = {
                 int(rowid): str(uname or "")
                 for rowid, uname in conn.execute("SELECT rowid, user_name FROM Name2Id")
             }
         except sqlite3.Error:
             return {}
+        if rel and fp is not None:
+            with self._cache_lock:
+                self._name2id_cache[rel] = (fp, mapping)
+        return mapping
 
     def _row_to_event(
         self,
@@ -666,6 +740,32 @@ class AccountRepository:
             clauses.append("create_time <= ?")
             params.append(int(until_ts))
 
+        if msg_types:
+            norm_types = [t.strip().lower() for t in msg_types if t and t.strip()]
+            if norm_types and all(t in _MSG_TYPE_TO_BASE_TYPES for t in norm_types):
+                base_codes = sorted(
+                    {code for t in norm_types for code in _MSG_TYPE_TO_BASE_TYPES[t]}
+                )
+                if len(base_codes) == 1:
+                    clauses.append("(local_type & 4294967295) = ?")
+                    params.append(base_codes[0])
+                else:
+                    placeholders = ", ".join("?" for _ in base_codes)
+                    clauses.append(f"(local_type & 4294967295) IN ({placeholders})")
+                    params.extend(base_codes)
+            if norm_types and all(t in _APPMSG_TYPE_TO_SUBTYPES for t in norm_types):
+                sub_codes = sorted(
+                    {0}
+                    | {
+                        sc
+                        for t in norm_types
+                        for sc in _APPMSG_TYPE_TO_SUBTYPES[t]
+                    }
+                )
+                sub_placeholders = ", ".join("?" for _ in sub_codes)
+                clauses.append(f"(local_type >> 32) IN ({sub_placeholders})")
+                params.extend(sub_codes)
+
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         has_post_filter = bool(msg_types or sender or keyword or not include_self)
         ascending_fetch = after_seq is not None and before_seq is None
@@ -697,7 +797,7 @@ class AccountRepository:
 
                 for conn, rel, table in shards:
                     shard_name = os.path.basename(rel)
-                    name_map = self._load_shard_name2id(conn)
+                    name_map = self._load_shard_name2id(conn, rel)
                     cols = self._table_columns(conn, rel, table)
                     wanted_cols = [
                         c
@@ -747,7 +847,7 @@ class AccountRepository:
                 break
             except sqlite3.DatabaseError as exc:
                 if attempt == 0 and _is_malformed_error(exc):
-                    self.pool.invalidate_all()
+                    self._invalidate_all()
                     continue
                 raise
             finally:
@@ -791,9 +891,16 @@ class AccountRepository:
             )
             return res["messages"]
 
-        chats = self.list_chats(chat_type=chat_type, limit=10_000, include_hidden=True)
+        chats = self.list_chats(
+            chat_type=chat_type,
+            limit=10_000,
+            include_hidden=True,
+            include_non_session=(since_ts is None),
+        )
         hits: list[MessageEvent] = []
         for chat in chats:
+            if since_ts is not None and (chat.last_timestamp <= 0 or chat.last_timestamp < since_ts - 60):
+                continue
             res = self.get_messages(
                 chat.chat_id,
                 chat_name=chat.display_name,
@@ -841,7 +948,7 @@ class AccountRepository:
                     where_sql = "WHERE " + " AND ".join(clauses)
                     for conn, rel, table in shards:
                         shard_name = os.path.basename(rel)
-                        name_map = self._load_shard_name2id(conn)
+                        name_map = self._load_shard_name2id(conn, rel)
                         cols = self._table_columns(conn, rel, table)
                         wanted_cols = [
                             c
@@ -881,7 +988,7 @@ class AccountRepository:
                     break
                 except sqlite3.DatabaseError as exc:
                     if attempt == 0 and _is_malformed_error(exc):
-                        self.pool.invalidate_all()
+                        self._invalidate_all()
                         continue
                     raise
                 finally:
@@ -934,7 +1041,7 @@ class AccountRepository:
                 return max_seqs
             except sqlite3.DatabaseError as exc:
                 if attempt == 0 and _is_malformed_error(exc):
-                    self.pool.invalidate_all()
+                    self._invalidate_all()
                     continue
                 raise
             finally:

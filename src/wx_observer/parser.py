@@ -23,6 +23,7 @@ _RAW_XML_RE = re.compile(
 )
 _CTRL_KEEP_NEWLINES_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]+")
 _MD5_ATTR_RE = re.compile(r'md5="([0-9a-fA-F]{32})"')
+_MD5_HEX_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 
 _ZSTD_MODULE: Any = None
 
@@ -267,6 +268,11 @@ def _parse_appmsg(
     if app_type == 6:
         size_raw = (appmsg.findtext("appattach/totallen") or "").strip()
         ext = (appmsg.findtext("appattach/fileext") or "").strip()[:32]
+        md5_raw = (
+            appmsg.findtext("md5")
+            or appmsg.findtext("appattach/md5")
+            or ""
+        ).strip()
         meta: dict[str, Any] = {"app_type": 6}
         if title:
             meta["filename"] = title
@@ -274,6 +280,8 @@ def _parse_appmsg(
             meta["size_bytes"] = int(size_raw)
         if ext:
             meta["file_ext"] = ext
+        if _MD5_HEX_RE.match(md5_raw):
+            meta["md5"] = md5_raw.lower()
         return ParsedMessage(
             msg_type="file",
             raw_type=raw_type,
@@ -319,6 +327,9 @@ def _parse_appmsg(
         meta = {"app_type": 19}
         if title:
             meta["title"] = title
+        embedded_files = _extract_recorditem_files(appmsg)
+        if embedded_files:
+            meta["embedded_files"] = embedded_files
         return ParsedMessage(
             msg_type="chat_history",
             raw_type=raw_type,
@@ -365,6 +376,37 @@ def _parse_appmsg(
         quote=None,
         metadata=meta,
     )
+
+
+def _extract_recorditem_files(appmsg: ElementTree.Element) -> list[dict[str, Any]]:
+    rec_el = appmsg.find("recorditem")
+    if rec_el is None:
+        return []
+    rec_raw = (rec_el.text or "").strip()
+    if not rec_raw and len(rec_el) > 0:
+        rec_raw = ElementTree.tostring(rec_el[0], encoding="unicode").strip()
+    rec_root = _safe_parse_xml(rec_raw)
+    if rec_root is None:
+        return []
+    files: list[dict[str, Any]] = []
+    for item in rec_root.findall(".//dataitem"):
+        if (item.attrib.get("datatype") or "").strip() != "8":
+            continue
+        fname = _clean_single_line(item.findtext("datatitle") or "", 240)
+        if not fname:
+            continue
+        entry: dict[str, Any] = {"filename": fname}
+        size_raw = (item.findtext("datasize") or "").strip()
+        if size_raw.isdigit():
+            entry["size_bytes"] = int(size_raw)
+        md5_raw = (item.findtext("fullmd5") or "").strip()
+        if _MD5_HEX_RE.match(md5_raw):
+            entry["md5"] = md5_raw.lower()
+        fmt = (item.findtext("datafmt") or "").strip()[:32]
+        if fmt:
+            entry["file_ext"] = fmt
+        files.append(entry)
+    return files
 
 
 def _parse_system_text(body: str) -> str:

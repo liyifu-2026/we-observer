@@ -67,9 +67,18 @@ def _print_chats_table(payload: dict) -> None:
         print(f"[{tag}] {c['display_name']} ({c['chat_id']}) | last={ts} | unread={c.get('unread_count', 0)}")
 
 
-def _print_event_line(ev: dict) -> None:
+def _print_event_line(ev: dict, *, fallback_chat: str = "") -> None:
+    if "t" in ev and "timestamp" not in ev:
+        ts = ev.get("t") or "-"
+        chat_label = ev.get("chat") or ev.get("chat_id") or fallback_chat or "-"
+        sender = ev.get("sender") or ("Me" if ev.get("self") else "-")
+        msg_type = ev.get("type") or "-"
+        quote = ev.get("quote")
+        q_part = f" [replying to: {quote}]" if isinstance(quote, str) and quote else ""
+        print(f"[{ts}] [{chat_label}] {sender} ({msg_type}): {ev.get('text')}{q_part}")
+        return
     ts = _format_ts(int(ev.get("timestamp") or 0))
-    chat_label = ev.get("chat_name") or ev.get("chat_id")
+    chat_label = ev.get("chat_name") or ev.get("chat_id") or fallback_chat
     sender = ev.get("sender_name") or ev.get("sender_id") or ("Me" if ev.get("is_self") else "-")
     tag = "GROUP" if ev.get("chat_type") == "group" else "DM"
     quote = ev.get("quote")
@@ -77,6 +86,58 @@ def _print_event_line(ev: dict) -> None:
     if isinstance(quote, dict) and quote.get("excerpt"):
         q_part = f" [replying to: {quote['excerpt']}]"
     print(f"[{ts}] [{tag} {chat_label}] {sender} ({ev.get('msg_type')}): {ev.get('text')}{q_part}")
+
+
+def _print_digest_summary(payload: dict) -> None:
+    summary = payload.get("summary") or {}
+    win = payload.get("window") or {}
+    print(
+        f"Digest account={payload.get('account_id')} scope={win.get('scope')} "
+        f"active_chats={summary.get('active_chats', 0)} total={summary.get('total_messages', 0)} "
+        f"signal={summary.get('signal_messages', 0)} noise={summary.get('noise_messages', 0)} "
+        f"est_tokens={payload.get('est_tokens', 0)}"
+    )
+    for chat in payload.get("per_chat") or []:
+        print(
+            f"- [{chat.get('chat_type')}] {chat.get('chat')} ({chat.get('chat_id')}): "
+            f"total={chat.get('total', 0)} signal={chat.get('signal_count', 0)}"
+        )
+        for hi in chat.get("highlights") or []:
+            print(f"    [{hi.get('t')}] {hi.get('sender')} ({hi.get('type')}): {hi.get('text')}")
+    attachments = payload.get("attachments") or []
+    if attachments:
+        print(f"Attachments ({len(attachments)}):")
+        for att in attachments[:10]:
+            flag = "OK" if att.get("available") else "MISSING"
+            path_part = f" -> {att['local_path']}" if att.get("local_path") else ""
+            print(f"  - [{flag}] {att.get('filename')} ({att.get('chat')} @ {att.get('t')}){path_part}")
+    links = payload.get("links") or []
+    if links:
+        print(f"Links ({len(links)}):")
+        for link in links[:10]:
+            label = f"{link['title']} - " if link.get("title") else ""
+            print(f"  - {label}{link.get('url')} ({link.get('chat')})")
+
+
+def _print_attachments_table(payload: dict) -> None:
+    items = payload.get("attachments") or []
+    print(
+        f"Attachments account={payload.get('account_id')} count={payload.get('count', 0)} "
+        f"available={payload.get('available_count', 0)} est_tokens={payload.get('est_tokens', 0)}"
+    )
+    if not items:
+        print("No matching attachments.")
+        return
+    for item in items:
+        flag = "AVAILABLE" if item.get("available") else "MISSING"
+        conf = f" [{item['match_confidence']}]" if item.get("match_confidence") else ""
+        size = item.get("size_bytes")
+        size_part = f" {size}B" if size is not None else ""
+        path_part = f"\n    path: {item['local_path']}" if item.get("local_path") else ""
+        print(
+            f"- [{flag}{conf}] {item.get('filename')}{size_part} | {item.get('t')} | "
+            f"{item.get('chat')} | {item.get('sender')}{path_part}"
+        )
 
 
 def _add_common_flags(parser: argparse.ArgumentParser, *, suppress_defaults: bool) -> None:
@@ -115,12 +176,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p_hist.add_argument("--limit", type=int, default=50)
     p_hist.add_argument("--before-seq", type=int, default=None)
     p_hist.add_argument("--after-seq", type=int, default=None)
-    p_hist.add_argument("--since", default=None, help="Start time (epoch seconds or ISO-8601)")
-    p_hist.add_argument("--until", default=None, help="End time (epoch seconds or ISO-8601)")
+    p_hist.add_argument("--since", default=None, help="Start time (relative e.g. '24h'/'7d', epoch seconds, or ISO-8601)")
+    p_hist.add_argument("--until", default=None, help="End time (relative, epoch seconds, or ISO-8601)")
     p_hist.add_argument("--type", action="append", dest="msg_types", help="Filter message types (comma-separated)")
     p_hist.add_argument("--sender", default=None, help="Filter by sender wxid or display name")
     p_hist.add_argument("--keyword", default=None, help="Filter messages containing keyword")
     p_hist.add_argument("--exclude-self", action="store_true", help="Exclude messages sent by this account")
+    p_hist.add_argument("--compact", action="store_true", help="Emit compact token-efficient message schema")
+    p_hist.add_argument("--max-chars", type=int, default=None, dest="max_chars", help="Truncate message text to N chars")
+    p_hist.add_argument("--skip-noise", action="store_true", help="Skip emoji/sticker and system notice messages")
     p_hist.add_argument("--export", dest="export_fmt", choices=["json", "jsonl", "csv", "md"], default=None)
     p_hist.add_argument("--output", default=None, help="Write exported messages to file path")
 
@@ -133,6 +197,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_search.add_argument("--since", default=None)
     p_search.add_argument("--until", default=None)
     p_search.add_argument("--limit", type=int, default=50)
+    p_search.add_argument("--compact", action="store_true", help="Emit compact keyword snippets")
+    p_search.add_argument("--max-chars", type=int, default=None, dest="max_chars", help="Truncate/snippet window width")
+    p_search.add_argument("--skip-noise", action="store_true", help="Skip emoji/sticker and system notice messages")
 
     p_watch = sub.add_parser("watch", parents=[common_sub], help="Stream newly arriving messages in real time")
     p_watch.add_argument("--account", default=None)
@@ -156,6 +223,30 @@ def _build_parser() -> argparse.ArgumentParser:
     p_mcp.add_argument("--token", default=None, help="Optional Bearer token for HTTP transport")
     p_mcp.add_argument("--account", default=None)
     p_mcp.add_argument("--pid", type=int, default=None)
+
+    p_digest = sub.add_parser("digest", parents=[common_sub], help="Build a compact cross-chat digest")
+    p_digest.add_argument("--scope", choices=["all", "private", "group"], default="all")
+    p_digest.add_argument("--chats", action="append", help="Restrict digest to specific chats (comma-separated or repeated)")
+    p_digest.add_argument("--since", default="24h", help="Window start (e.g. '24h', '7d', ISO-8601, or epoch)")
+    p_digest.add_argument("--until", default=None, help="Window end")
+    p_digest.add_argument("--buckets", choices=["hour", "day", "none"], default="hour")
+    p_digest.add_argument("--include", action="append", help="Sections (counts,top_senders,links,attachments,mentions,highlights)")
+    p_digest.add_argument("--highlights", type=int, default=8, dest="highlights", help="Max highlight items per chat")
+    p_digest.add_argument("--max-chars", type=int, default=160, dest="max_chars", help="Max highlight text length")
+    p_digest.add_argument("--exclude-self", action="store_true", help="Exclude messages sent by this account")
+    p_digest.add_argument("--account", default=None)
+    p_digest.add_argument("--pid", type=int, default=None)
+
+    p_attach = sub.add_parser("attachments", parents=[common_sub], help="List file attachments and local plaintext paths")
+    p_attach.add_argument("--scope", choices=["all", "private", "group"], default="all")
+    p_attach.add_argument("--chats", action="append", help="Restrict search to specific chats (comma-separated or repeated)")
+    p_attach.add_argument("--since", default="7d", help="Window start (e.g. '7d', '24h', ISO-8601, or epoch)")
+    p_attach.add_argument("--until", default=None)
+    p_attach.add_argument("--ext", action="append", dest="ext", help="Filter file extensions (e.g. pdf,docx)")
+    p_attach.add_argument("--only-available", action="store_true", help="Only list attachments found on local disk")
+    p_attach.add_argument("--limit", type=int, default=50)
+    p_attach.add_argument("--account", default=None)
+    p_attach.add_argument("--pid", type=int, default=None)
 
     p_ui = sub.add_parser("ui", parents=[common_sub], help="Launch the minimal local read-only Web UI")
     p_ui.add_argument("--host", default="127.0.0.1")
@@ -214,6 +305,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 sender=args.sender,
                 keyword=args.keyword,
                 include_self=not args.exclude_self,
+                detail="compact" if args.compact else "full",
+                max_text_chars=args.max_chars,
+                skip_noise=bool(args.skip_noise),
                 account=args.account,
                 pid=args.pid,
             )
@@ -247,7 +341,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if not res["messages"]:
                     print("No matching messages.")
                 for ev in res["messages"]:
-                    _print_event_line(ev)
+                    _print_event_line(ev, fallback_chat=res["chat"]["display_name"])
             return 0
 
         if cmd == "search":
@@ -258,6 +352,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 since=args.since,
                 until=args.until,
                 limit=args.limit,
+                detail="compact" if args.compact else "full",
+                max_text_chars=args.max_chars,
+                skip_noise=bool(args.skip_noise),
                 account=args.account,
                 pid=args.pid,
             )
@@ -268,6 +365,44 @@ def main(argv: Sequence[str] | None = None) -> int:
                     print("No matching messages.")
                 for ev in res["messages"]:
                     _print_event_line(ev)
+            return 0
+
+        if cmd == "digest":
+            res = service.digest(
+                scope=args.scope,
+                chats=_split_csv_arg(args.chats) or None,
+                since=args.since,
+                until=args.until,
+                buckets=args.buckets,
+                include=_split_csv_arg(args.include) or None,
+                max_highlights_per_chat=args.highlights,
+                max_text_chars=args.max_chars,
+                include_self=not args.exclude_self,
+                account=args.account,
+                pid=args.pid,
+            )
+            if args.as_json:
+                print(format_json(res))
+            else:
+                _print_digest_summary(res)
+            return 0
+
+        if cmd == "attachments":
+            res = service.list_attachments(
+                scope=args.scope,
+                chats=_split_csv_arg(args.chats) or None,
+                since=args.since,
+                until=args.until,
+                extensions=_split_csv_arg(args.ext) or None,
+                only_available=bool(args.only_available),
+                limit=args.limit,
+                account=args.account,
+                pid=args.pid,
+            )
+            if args.as_json:
+                print(format_json(res))
+            else:
+                _print_attachments_table(res)
             return 0
 
         if cmd == "watch":
