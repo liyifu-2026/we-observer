@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import os
 import re
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+import psutil
 
 from wx_observer.attachments import collect_attachments
 from wx_observer.digest import build_digest
@@ -60,6 +63,12 @@ def parse_timestamp(value: int | float | str | None) -> int | None:
     return int(dt.timestamp())
 
 
+def _norm_path_key(path: str | None) -> str | None:
+    if not path:
+        return None
+    return os.path.normcase(os.path.abspath(path))
+
+
 class ObserverService:
     """Thread-safe service coordinating discovery, stateless account lookup, and cursor watching."""
 
@@ -70,6 +79,7 @@ class ObserverService:
         keys_file: str | None = None,
         state_dir: str | Path | None = None,
         temp_root: str | Path | None = None,
+        account_cache_ttl: float = 30.0,
     ) -> None:
         self.db_dir = db_dir
         self.keys_file = keys_file
@@ -81,6 +91,11 @@ class ObserverService:
         self._repos: dict[tuple[str, int | None], AccountRepository] = {}
         self._monitors: dict[tuple[str, int | None], RealtimeMonitor] = {}
         self._selected_key: tuple[str, int | None] | None = None
+        self._account_cache_ttl = max(0.0, float(account_cache_ttl))
+        self._alias_cache: dict[
+            tuple[str, int | None, str | None, str | None],
+            tuple[tuple[str, int | None], float],
+        ] = {}
 
     def close(self) -> None:
         with self._registry_lock:
@@ -90,6 +105,7 @@ class ObserverService:
                 repo.close()
             self._monitors.clear()
             self._repos.clear()
+            self._alias_cache.clear()
             self._selected_key = None
 
     def list_accounts(self, *, db_dir: str | None = None) -> dict[str, Any]:
@@ -193,6 +209,13 @@ class ObserverService:
             {"accounts": [a.to_dict() for a in accounts]},
         )
 
+    @staticmethod
+    def _is_cached_key_alive(cache_key: tuple[str, int | None]) -> bool:
+        _acct_id, bound_pid = cache_key
+        if bound_pid is None:
+            return True
+        return bool(psutil.pid_exists(bound_pid))
+
     def _open_or_reuse(
         self,
         *,
@@ -201,27 +224,61 @@ class ObserverService:
         db_dir: str | None = None,
         keys_file: str | None = None,
         make_default: bool = False,
+        refresh: bool = False,
     ) -> tuple[AccountRepository, RealtimeMonitor, AccountInfo]:
+        eff_db_dir = db_dir or self.db_dir
+        eff_keys = keys_file or self.keys_file
+        db_key = _norm_path_key(eff_db_dir)
+        keys_key = _norm_path_key(eff_keys)
+
         with self._registry_lock:
-            if not make_default and account is None and pid is None and self._selected_key is not None:
+            if (
+                not make_default
+                and not refresh
+                and account is None
+                and pid is None
+                and db_dir is None
+                and keys_file is None
+                and self._selected_key is not None
+            ):
                 key = self._selected_key
                 repo = self._repos[key]
                 mon = self._monitors[key]
                 return repo, mon, repo.account
 
-            eff_db_dir = db_dir or self.db_dir
-            eff_keys = keys_file or self.keys_file
-            env = discover_environment(db_dir=eff_db_dir)
-            chosen, target_pids = self._match_account(
-                env["accounts"],
-                account=account,
-                pid=pid,
-                keys_file=eff_keys,
-                reason=env["reason"],
-            )
-            bound_pid = target_pids[0] if len(target_pids) == 1 else (pid if pid is not None else None)
-            cache_key = (chosen.account_id, bound_pid)
+            if (
+                not make_default
+                and not refresh
+                and (account is not None or pid is not None)
+                and self._account_cache_ttl > 0
+            ):
+                ref_norm = account.strip().casefold() if account else ""
+                alias_key = (ref_norm, pid, db_key, keys_key)
+                cached = self._alias_cache.get(alias_key)
+                if cached is not None:
+                    cache_key, cached_at = cached
+                    if (
+                        (time.monotonic() - cached_at) <= self._account_cache_ttl
+                        and cache_key in self._repos
+                        and self._is_cached_key_alive(cache_key)
+                    ):
+                        repo = self._repos[cache_key]
+                        mon = self._monitors[cache_key]
+                        return repo, mon, repo.account
+                    self._alias_cache.pop(alias_key, None)
 
+        env = discover_environment(db_dir=eff_db_dir)
+        chosen, target_pids = self._match_account(
+            env["accounts"],
+            account=account,
+            pid=pid,
+            keys_file=eff_keys,
+            reason=env["reason"],
+        )
+        bound_pid = target_pids[0] if len(target_pids) == 1 else (pid if pid is not None else None)
+        cache_key = (chosen.account_id, bound_pid)
+
+        with self._registry_lock:
             if cache_key not in self._repos:
                 repo = AccountRepository(
                     chosen,
@@ -236,6 +293,23 @@ class ObserverService:
             else:
                 repo = self._repos[cache_key]
                 mon = self._monitors[cache_key]
+
+            now_mono = time.monotonic()
+            self._alias_cache[(chosen.account_id.casefold(), pid, db_key, keys_key)] = (
+                cache_key,
+                now_mono,
+            )
+            self._alias_cache[(chosen.wxid.casefold(), pid, db_key, keys_key)] = (
+                cache_key,
+                now_mono,
+            )
+            if account:
+                self._alias_cache[(account.strip().casefold(), pid, db_key, keys_key)] = (
+                    cache_key,
+                    now_mono,
+                )
+            if pid is not None and account is None:
+                self._alias_cache[("", pid, db_key, keys_key)] = (cache_key, now_mono)
 
             if make_default or self._selected_key is None:
                 self._selected_key = cache_key
@@ -255,6 +329,7 @@ class ObserverService:
             db_dir=db_dir,
             keys_file=keys_file,
             make_default=True,
+            refresh=True,
         )
         chosen.selected = True
         chosen.display_name = repo.get_own_display_name()
@@ -482,11 +557,14 @@ class ObserverService:
         pid: int | None = None,
     ) -> dict[str, Any]:
         repo, mon, _chosen = self._open_or_reuse(account=account, pid=pid, make_default=False)
-        committed = mon.ack(cursor_id=cursor_id, ack_token=ack_token, upto=upto)
+        committed, already_committed = mon.ack_detailed(
+            cursor_id=cursor_id, ack_token=ack_token, upto=upto
+        )
         return {
             "ok": True,
             "account_id": repo.account.account_id,
             "cursor_id": cursor_id,
+            "already_committed": already_committed,
             "committed_chats": len(committed),
             "committed": committed,
         }

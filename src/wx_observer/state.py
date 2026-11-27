@@ -68,10 +68,19 @@ class CursorStateStore:
                         account_id TEXT NOT NULL,
                         cursor_id TEXT NOT NULL,
                         watermarks_json TEXT NOT NULL,
-                        created_at INTEGER NOT NULL
+                        created_at INTEGER NOT NULL,
+                        committed_at INTEGER
                     )
                     """
                 )
+                cols = {
+                    row["name"]
+                    for row in conn.execute("PRAGMA table_info(pending_acks)").fetchall()
+                }
+                if "committed_at" not in cols:
+                    conn.execute(
+                        "ALTER TABLE pending_acks ADD COLUMN committed_at INTEGER"
+                    )
         finally:
             conn.close()
 
@@ -239,15 +248,19 @@ class CursorStateStore:
         account_id: str,
         cursor_id: str,
         ack_token: str,
-    ) -> dict[str, int]:
-        """Atomically commit watermarks referenced by ack_token for (account_id, cursor_id)."""
+    ) -> tuple[dict[str, int], bool]:
+        """Atomically and idempotently commit watermarks referenced by ack_token.
+
+        Returns ``(committed_watermarks, already_committed)`` so retries after
+        timeout or context compaction replay cleanly without losing progress.
+        """
         now = int(time.time())
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 """
-                SELECT watermarks_json, created_at
+                SELECT watermarks_json, created_at, committed_at
                 FROM pending_acks
                 WHERE ack_token = ? AND account_id = ? AND cursor_id = ?
                 """,
@@ -262,6 +275,9 @@ class CursorStateStore:
                 )
             raw_map = json.loads(row["watermarks_json"] or "{}")
             updates = {str(k): int(v) for k, v in raw_map.items()}
+            if row["committed_at"] is not None:
+                conn.rollback()
+                return updates, True
             for chat_id, seq in updates.items():
                 conn.execute(
                     """
@@ -275,11 +291,11 @@ class CursorStateStore:
                     (account_id, cursor_id, chat_id, int(seq), now),
                 )
             conn.execute(
-                "DELETE FROM pending_acks WHERE ack_token = ?",
-                (ack_token,),
+                "UPDATE pending_acks SET committed_at = ? WHERE ack_token = ?",
+                (now, ack_token),
             )
             conn.commit()
-            return updates
+            return updates, False
         except Exception:
             if conn.in_transaction:
                 conn.rollback()

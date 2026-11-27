@@ -263,6 +263,39 @@ class RealtimeMonitor:
         """Auto-committing poll preserving backward compatibility for CLI and direct callers."""
         return self.poll_batch(cursor_id=cursor_id, limit=limit, peek=False).events
 
+    def ack_detailed(
+        self,
+        *,
+        cursor_id: str = "default",
+        ack_token: str | None = None,
+        upto: dict[str, int] | None = None,
+    ) -> tuple[dict[str, int], bool]:
+        """Explicitly and idempotently commit watermarks from a previous peek=True poll."""
+        with self._cursor_lock(cursor_id):
+            if ack_token:
+                committed, already_committed = self.state_store.apply_pending_ack(
+                    self.account_id,
+                    cursor_id,
+                    ack_token,
+                )
+                if not already_committed:
+                    self._last_fingerprints.pop(cursor_id, None)
+                return committed, already_committed
+            elif upto:
+                clean_upto = {str(k): int(v) for k, v in upto.items()}
+                self.state_store.commit_watermarks(
+                    self.account_id,
+                    cursor_id,
+                    clean_upto,
+                )
+                self._last_fingerprints.pop(cursor_id, None)
+                return clean_upto, False
+            else:
+                raise WxObserverError(
+                    "invalid_ack",
+                    "Provide either ack_token or a non-empty upto {chat_id: sort_seq} mapping.",
+                )
+
     def ack(
         self,
         *,
@@ -271,28 +304,12 @@ class RealtimeMonitor:
         upto: dict[str, int] | None = None,
     ) -> dict[str, int]:
         """Explicitly commit watermarks from a previous peek=True poll."""
-        with self._cursor_lock(cursor_id):
-            if ack_token:
-                committed = self.state_store.apply_pending_ack(
-                    self.account_id,
-                    cursor_id,
-                    ack_token,
-                )
-            elif upto:
-                clean_upto = {str(k): int(v) for k, v in upto.items()}
-                self.state_store.commit_watermarks(
-                    self.account_id,
-                    cursor_id,
-                    clean_upto,
-                )
-                committed = clean_upto
-            else:
-                raise WxObserverError(
-                    "invalid_ack",
-                    "Provide either ack_token or a non-empty upto {chat_id: sort_seq} mapping.",
-                )
-            self._last_fingerprints.pop(cursor_id, None)
-            return committed
+        committed, _already_committed = self.ack_detailed(
+            cursor_id=cursor_id,
+            ack_token=ack_token,
+            upto=upto,
+        )
+        return committed
 
     def wait_for_batch(
         self,

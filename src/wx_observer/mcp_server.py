@@ -41,6 +41,8 @@ async def _exec_tool(fn: Callable[..., dict[str, Any]], /, *args: Any, **kwargs:
             "ok": False,
             "error": "internal_error",
             "message": f"{type(exc).__name__}: {exc}",
+            "retryable": True,
+            "next_action": "Retry once; if it persists, inspect logs or call get_status.",
         }
 
 
@@ -60,7 +62,7 @@ def create_mcp_server(
     """Create a read-only MCPServer exposing account discovery, history, digests, attachments, and live watching."""
     server = MCPServer(
         name=name,
-        version="0.3.1",
+        version="0.3.2",
         instructions=(
             "Read-only Windows WeChat 4.x local observer. "
             "Use list_accounts and select_account (or pass explicit account='...' per call without mutating global state). "
@@ -122,7 +124,7 @@ def create_mcp_server(
         description=(
             "Extract historical messages from a private or group chat (by chat_id, remark, nickname, or group name). "
             "Supports pagination (before_seq/after_seq), relative/ISO/epoch time range (since/until e.g. '24h', '7d'), type, sender, and keyword filters. "
-            "Defaults to detail='compact' (300-char cap unless max_text_chars is set; 0 disables truncation), skip_noise=True, and est_tokens."
+            "Defaults to detail='compact' (300-char cap unless max_text_chars is set; 0 disables truncation), skip_noise=True (skips emojis while keeping system notices marked noise=true), and est_tokens."
         ),
         annotations=_READONLY_TOOL,
     )
@@ -197,7 +199,8 @@ def create_mcp_server(
     @server.tool(
         name="configure_watch",
         description=(
-            "Configure real-time message monitoring rules for an isolated cursor_id. "
+            "Configure real-time message monitoring rules for an isolated cursor_id "
+            "(pass a dedicated cursor_id in multi-consumer setups to avoid sharing 'default'). "
             "Supports mode='all'|'private'|'group'|'allowlist', chat allow/exclude lists, include_self, and cursor reset."
         ),
         annotations=_POLL_TOOL,
@@ -227,7 +230,8 @@ def create_mcp_server(
     @server.tool(
         name="poll_new_messages",
         description=(
-            "Non-blocking poll for newly arrived messages since the persisted watermark for cursor_id. "
+            "Non-blocking poll for newly arrived messages since the persisted watermark for cursor_id "
+            "(use a distinct cursor_id per consumer). "
             "Defaults to peek=True (returns ack_token without advancing watermark until ack_messages is called) and detail='compact'."
         ),
         annotations=_POLL_TOOL,
@@ -256,9 +260,10 @@ def create_mcp_server(
         name="ack_messages",
         description=(
             "Commit persisted read watermarks returned by poll_new_messages or wait_for_messages when peek=True. "
-            "Pass ack_token from the poll response, and optionally upto={chat_id: max_sort_seq} for partial acknowledgment."
+            "Pass ack_token from the poll response (retrying with the same ack_token is idempotent and returns already_committed=True), "
+            "or pass upto={chat_id: max_sort_seq} for partial acknowledgment."
         ),
-        annotations=_POLL_TOOL,
+        annotations=_READONLY_TOOL,
     )
     async def ack_messages(
         cursor_id: str = "default",
@@ -277,8 +282,9 @@ def create_mcp_server(
     @server.tool(
         name="wait_for_messages",
         description=(
-            "Long-poll for newly arrived messages for cursor_id; returns immediately when new messages arrive "
-            "or returns empty after timeout_seconds. Defaults to peek=True (issues ack_token) and detail='compact'."
+            "Long-poll for newly arrived messages for cursor_id (use a distinct cursor_id per consumer); "
+            "returns immediately when new messages arrive or returns empty after timeout_seconds. "
+            "Defaults to peek=True (issues ack_token) and detail='compact'."
         ),
         annotations=_POLL_TOOL,
     )
@@ -409,7 +415,13 @@ class _BearerAuthASGI:
                     break
             if not hmac.compare_digest(auth_val, self.expected):
                 body = json.dumps(
-                    {"ok": False, "error": "unauthorized", "message": "Missing or invalid Bearer token."}
+                    {
+                        "ok": False,
+                        "error": "unauthorized",
+                        "message": "Missing or invalid Bearer token.",
+                        "retryable": False,
+                        "next_action": "Provide a valid Authorization: Bearer <token> header.",
+                    }
                 ).encode("utf-8")
                 await send(
                     {

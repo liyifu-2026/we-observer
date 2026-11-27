@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import sys
 import threading
 import time
@@ -14,12 +15,19 @@ import pytest
 
 from tests.fixtures import SyntheticAccountEnv, make_file_xml, make_link_xml, make_quote_xml
 import wx_observer.attachments as attachments_mod
+import wx_observer.service as service_mod
 from wx_observer.attachments import build_file_index, resolve_local_file
 from wx_observer.cipher_store import EncryptedDatabasePool, quick_check_sqlite
 from wx_observer.cli import main as cli_main
-from wx_observer.exceptions import WxObserverError
+from wx_observer.exceptions import (
+    ChatNotFoundError,
+    DatabaseCorruptError,
+    KeyUnavailableError,
+    WxObserverError,
+)
 from wx_observer.models import ChatInfo
 from wx_observer.service import ObserverService, parse_timestamp
+from wx_observer.state import CursorStateStore
 
 
 def test_compact_shaping_truncation_noise_and_tokens(tmp_path) -> None:
@@ -52,8 +60,15 @@ def test_compact_shaping_truncation_noise_and_tokens(tmp_path) -> None:
         )
         assert compact["ok"] is True
         assert compact["detail"] == "compact"
-        assert compact["skipped_noise"] == 2
+        assert compact["skipped_noise"] == 1
         assert compact["est_tokens"] > 0
+
+        assert not [m for m in compact["messages"] if m["seq"] == 610]
+        sys_items = [m for m in compact["messages"] if m["seq"] == 620]
+        assert len(sys_items) == 1
+        assert sys_items[0]["type"] == "system"
+        assert sys_items[0]["noise"] is True
+        assert "撤回了一条消息" in sys_items[0]["text"]
 
         long_items = [m for m in compact["messages"] if m["seq"] == 600]
         assert len(long_items) == 1
@@ -879,6 +894,255 @@ def test_parallel_prefetch_and_chunked_decrypt(tmp_path) -> None:
         assert len(set(gens)) == len(rels)
     finally:
         pool.cleanup()
+
+
+def test_ack_messages_idempotent_replay_and_legacy_schema_migration(tmp_path) -> None:
+    env = SyntheticAccountEnv(tmp_path / "wx")
+    now = int(time.time())
+    state_dir = tmp_path / "state"
+
+    service = ObserverService(
+        db_dir=str(env.db_dir),
+        keys_file=str(env.keys_file),
+        state_dir=state_dir,
+        temp_root=tmp_path / "pool",
+    )
+    try:
+        service.configure_watch(cursor_id="idem-c1", mode="private", account=env.account_id)
+        base = service.poll_new_messages(cursor_id="idem-c1", peek=True, account=env.account_id)
+        assert base["count"] == 0
+
+        env.append_wal_messages(
+            env.alice_id,
+            [(40, 1, 900, 3, now - 5, "First batch message")],
+        )
+        p1 = service.poll_new_messages(cursor_id="idem-c1", peek=True, account=env.account_id)
+        assert p1["count"] == 1
+        tok1 = p1["ack_token"]
+        assert tok1
+
+        ack1 = service.ack_messages(cursor_id="idem-c1", ack_token=tok1, account=env.account_id)
+        assert ack1["ok"] is True
+        assert ack1["already_committed"] is False
+        assert ack1["committed"] == {env.alice_id: 900}
+
+        # Idempotent replay of the same ack_token must succeed with already_committed=True
+        ack1_replay = service.ack_messages(
+            cursor_id="idem-c1", ack_token=tok1, account=env.account_id
+        )
+        assert ack1_replay["ok"] is True
+        assert ack1_replay["already_committed"] is True
+        assert ack1_replay["committed"] == {env.alice_id: 900}
+
+        # Advance cursor further, then replay the OLD tok1 -> no watermark regression
+        env.append_wal_messages(
+            env.alice_id,
+            [(41, 1, 950, 3, now - 2, "Second batch message")],
+        )
+        p2 = service.poll_new_messages(cursor_id="idem-c1", peek=True, account=env.account_id)
+        assert p2["count"] == 1
+        ack2 = service.ack_messages(
+            cursor_id="idem-c1", ack_token=p2["ack_token"], account=env.account_id
+        )
+        assert ack2["already_committed"] is False
+        assert ack2["committed"] == {env.alice_id: 950}
+
+        old_replay = service.ack_messages(
+            cursor_id="idem-c1", ack_token=tok1, account=env.account_id
+        )
+        assert old_replay["ok"] is True
+        assert old_replay["already_committed"] is True
+        assert service._state_store.get_watermarks(env.account_id, "idem-c1")[env.alice_id] == 950
+
+        # Negative: mismatched cursor, unknown token, and post-reset replay all fail closed
+        with pytest.raises(WxObserverError) as exc_cursor:
+            service.ack_messages(cursor_id="other-cursor", ack_token=tok1, account=env.account_id)
+        assert exc_cursor.value.code == "invalid_ack_token"
+
+        with pytest.raises(WxObserverError) as exc_missing:
+            service.ack_messages(cursor_id="idem-c1", ack_token="nonexistent", account=env.account_id)
+        assert exc_missing.value.code == "invalid_ack_token"
+
+        service.configure_watch(
+            cursor_id="idem-c1", mode="private", reset_cursor=True, account=env.account_id
+        )
+        with pytest.raises(WxObserverError) as exc_reset:
+            service.ack_messages(cursor_id="idem-c1", ack_token=tok1, account=env.account_id)
+        assert exc_reset.value.code == "invalid_ack_token"
+    finally:
+        service.close()
+
+    # Legacy schema migration: pre-v0.3.2 pending_acks lacking committed_at
+    legacy_dir = tmp_path / "legacy_state"
+    legacy_dir.mkdir(parents=True, exist_ok=True)
+    legacy_db = legacy_dir / "state.db"
+    conn = sqlite3.connect(str(legacy_db))
+    try:
+        conn.execute(
+            """
+            CREATE TABLE pending_acks (
+                ack_token TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                cursor_id TEXT NOT NULL,
+                watermarks_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    migrated = CursorStateStore(state_dir=legacy_dir)
+    verify_conn = sqlite3.connect(str(legacy_db))
+    try:
+        cols = {row[1] for row in verify_conn.execute("PRAGMA table_info(pending_acks)").fetchall()}
+        assert "committed_at" in cols
+    finally:
+        verify_conn.close()
+
+    tok_legacy = migrated.save_pending_ack(env.account_id, "mig", {env.alice_id: 123})
+    committed_1, replay_1 = migrated.apply_pending_ack(env.account_id, "mig", tok_legacy)
+    committed_2, replay_2 = migrated.apply_pending_ack(env.account_id, "mig", tok_legacy)
+    assert committed_1 == {env.alice_id: 123} and replay_1 is False
+    assert committed_2 == {env.alice_id: 123} and replay_2 is True
+
+
+def test_explicit_account_alias_cache_ttl_and_lock_free_discovery(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "shared_wx"
+    env_a = SyntheticAccountEnv(root, account_id="wxid_alpha_acct_1111")
+    env_b = SyntheticAccountEnv(root, account_id="wxid_beta_acct_2222")
+    master_keys = tmp_path / "master_keys.json"
+    master_keys.write_text(json.dumps({"master_key": "11" * 32}), encoding="utf-8")
+
+    orig_discover = service_mod.discover_environment
+    discover_calls: list[str | None] = []
+
+    def counting_discover(*, db_dir=None, selected_account=None):
+        discover_calls.append(db_dir)
+        return orig_discover(db_dir=db_dir, selected_account=selected_account)
+
+    monkeypatch.setattr(service_mod, "discover_environment", counting_discover)
+
+    service = ObserverService(
+        db_dir=str(env_a.db_dir),
+        keys_file=str(master_keys),
+        state_dir=tmp_path / "state",
+        temp_root=tmp_path / "pool",
+        account_cache_ttl=30.0,
+    )
+    try:
+        sel = service.select_account(account=env_a.account_id)
+        assert sel["ok"] is True
+        assert len(discover_calls) == 1
+
+        # First explicit call for Beta runs discovery once and populates alias cache for both account_id and wxid
+        chats_b = service.list_chats(account=env_b.account_id)
+        assert chats_b["account_id"] == env_b.account_id
+        assert len(discover_calls) == 2
+
+        # Subsequent explicit calls via account_id or wxid reuse cache (0 extra discovery calls)
+        msgs_b = service.get_messages("AliceRemark", account=env_b.account_id)
+        search_b = service.search_messages("中文测试", account="wxid_beta_acct")
+        assert msgs_b["account_id"] == env_b.account_id
+        assert search_b["account_id"] == env_b.account_id
+        assert len(discover_calls) == 2
+        assert service._selected_key == (env_a.account_id, None)
+
+        # select_account always forces refresh even within TTL
+        service.select_account(account=env_a.account_id)
+        assert len(discover_calls) == 3
+    finally:
+        service.close()
+
+    # TTL expiration forces re-discovery
+    discover_calls.clear()
+    ttl_service = ObserverService(
+        db_dir=str(env_a.db_dir),
+        keys_file=str(master_keys),
+        state_dir=tmp_path / "ttl_state",
+        temp_root=tmp_path / "ttl_pool",
+        account_cache_ttl=0.05,
+    )
+    try:
+        ttl_service.list_chats(account=env_a.account_id)
+        ttl_service.list_chats(account=env_a.account_id)
+        assert len(discover_calls) == 1
+        time.sleep(0.08)
+        ttl_service.list_chats(account=env_a.account_id)
+        assert len(discover_calls) == 2
+    finally:
+        ttl_service.close()
+
+    # Slow uncached discovery does NOT hold _registry_lock and never blocks cached account reads
+    slow_entered = threading.Event()
+    slow_release = threading.Event()
+    mode_gate = {"block_next": False}
+
+    def gated_discover(*, db_dir=None, selected_account=None):
+        if mode_gate["block_next"]:
+            mode_gate["block_next"] = False
+            slow_entered.set()
+            assert slow_release.wait(timeout=5.0)
+        return orig_discover(db_dir=db_dir, selected_account=selected_account)
+
+    monkeypatch.setattr(service_mod, "discover_environment", gated_discover)
+    lock_service = ObserverService(
+        db_dir=str(env_a.db_dir),
+        keys_file=str(master_keys),
+        state_dir=tmp_path / "lock_state",
+        temp_root=tmp_path / "lock_pool",
+        account_cache_ttl=30.0,
+    )
+    try:
+        lock_service.list_chats(account=env_a.account_id)
+        mode_gate["block_next"] = True
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            fut_uncached = pool.submit(lock_service.list_chats, account=env_b.account_id)
+            assert slow_entered.wait(timeout=2.0)
+
+            cached_done = threading.Event()
+
+            def call_cached():
+                res = lock_service.list_chats(account=env_a.account_id)
+                cached_done.set()
+                return res
+
+            fut_cached = pool.submit(call_cached)
+            assert cached_done.wait(timeout=1.5), "Cached lookup blocked on uncached discovery!"
+            assert fut_cached.result()["account_id"] == env_a.account_id
+
+            slow_release.set()
+            assert fut_uncached.result()["account_id"] == env_b.account_id
+
+        # Dead bound PID invalidation check
+        assert lock_service._is_cached_key_alive((env_a.account_id, None)) is True
+        monkeypatch.setattr(service_mod.psutil, "pid_exists", lambda _pid: False)
+        assert lock_service._is_cached_key_alive((env_a.account_id, 999999)) is False
+    finally:
+        slow_release.set()
+        lock_service.close()
+
+
+def test_structured_error_contract_retryable_and_next_action() -> None:
+    d_chat = ChatNotFoundError("unknown_chat").to_error_dict()
+    assert d_chat["ok"] is False
+    assert d_chat["error"] == "chat_not_found"
+    assert d_chat["retryable"] is False
+    assert isinstance(d_chat["next_action"], str) and d_chat["next_action"]
+
+    d_ack = WxObserverError("invalid_ack_token", "bad token").to_error_dict()
+    assert d_ack["retryable"] is False
+    assert "poll_new_messages" in d_ack["next_action"]
+
+    d_db = DatabaseCorruptError("db_decrypt_failed", "busy").to_error_dict()
+    assert d_db["retryable"] is True
+    assert d_db["next_action"]
+
+    d_key = KeyUnavailableError("keys_unavailable", "locked").to_error_dict()
+    assert d_key["retryable"] is True
+    assert d_key["next_action"]
 
 
 

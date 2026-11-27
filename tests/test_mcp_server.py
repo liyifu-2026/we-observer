@@ -157,14 +157,26 @@ def test_mcp_all_12_tools_over_memory_transport(tmp_path) -> None:
             )
             assert redeliver["count"] == 1
 
-            # Explicit ack commits watermark
+            # Explicit ack commits watermark and supports idempotent retry
             ack_res = _extract_json_result(
                 await client.call_tool(
                     "ack_messages",
                     {"cursor_id": "mcp-test", "ack_token": waited["ack_token"]},
                 )
             )
-            assert ack_res["ok"] is True and ack_res["committed"] == {env.alice_id: 999}
+            assert ack_res["ok"] is True
+            assert ack_res["already_committed"] is False
+            assert ack_res["committed"] == {env.alice_id: 999}
+
+            ack_retry = _extract_json_result(
+                await client.call_tool(
+                    "ack_messages",
+                    {"cursor_id": "mcp-test", "ack_token": waited["ack_token"]},
+                )
+            )
+            assert ack_retry["ok"] is True
+            assert ack_retry["already_committed"] is True
+            assert ack_retry["committed"] == {env.alice_id: 999}
 
             after_ack = _extract_json_result(
                 await client.call_tool("poll_new_messages", {"cursor_id": "mcp-test"})
@@ -176,11 +188,13 @@ def test_mcp_all_12_tools_over_memory_transport(tmp_path) -> None:
             )
             assert status["status"]["tracked_chats"] >= 2
 
-            # Structured domain error (no stacktrace leak)
+            # Structured domain error (no stacktrace leak, exposes retryable + next_action)
             missing = _extract_json_result(
                 await client.call_tool("get_messages", {"chat": "does_not_exist"})
             )
             assert missing["ok"] is False and missing["error"] == "chat_not_found"
+            assert missing["retryable"] is False
+            assert isinstance(missing["next_action"], str) and missing["next_action"]
 
     try:
         anyio.run(scenario)

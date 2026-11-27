@@ -36,6 +36,8 @@ def _bucket_label(ts: int, buckets: str) -> str:
 
 
 def _highlight_score(ev: MessageEvent) -> tuple[int, int, int]:
+    if ev.msg_type == "system":
+        return (0, len(ev.text or ""), ev.timestamp)
     priority = 1
     if ev.msg_type in ("file", "link", "chat_history"):
         priority = 4

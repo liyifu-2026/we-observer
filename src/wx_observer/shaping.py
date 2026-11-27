@@ -9,7 +9,8 @@ from typing import Any
 
 from wx_observer.models import MessageEvent
 
-NOISE_MSG_TYPES = frozenset({"emoji", "system"})
+NOISE_MSG_TYPES = frozenset({"emoji"})
+LOW_SIGNAL_MSG_TYPES = frozenset({"system"})
 
 _COMPACT_META_KEYS = (
     "filename",
@@ -25,7 +26,7 @@ _COMPACT_META_KEYS = (
 
 
 def is_noise_message(event: MessageEvent) -> bool:
-    """Return True for low-signal chat noise such as sticker/emoji or system notices."""
+    """Return True for pure chat noise such as animated sticker/emoji placeholders."""
     return event.msg_type in NOISE_MSG_TYPES
 
 
@@ -124,6 +125,8 @@ def shape_message(
         out["chat_id"] = event.chat_id
     if event.is_self:
         out["self"] = True
+    if event.msg_type in LOW_SIGNAL_MSG_TYPES:
+        out["noise"] = True
     if was_truncated:
         out["truncated"] = True
         out["full_length"] = orig_len
