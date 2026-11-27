@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>wx-observer · 微信只读实时监控</title>
+  <link rel="stylesheet" href="/assets/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="topbar-left">
+        <span class="brand">wx-observer</span>
+        <span class="badge">只读监控</span>
+        <select id="accountSelect" title="选择微信账号"></select>
+        <button id="refreshAccountsBtn" class="btn" type="button">刷新账号</button>
+      </div>
+      <div class="topbar-right">
+        <div id="liveStatusPill" class="status-pill status-idle">
+          <span class="dot"></span>
+          <span id="liveStatusText">初始化中</span>
+        </div>
+        <button id="toggleWatchBtn" class="btn btn-primary" type="button">暂停</button>
+      </div>
+    </header>
+
+    <div id="bannerError" class="banner hidden">
+      <span id="bannerErrorText"></span>
+      <button id="bannerDismissBtn" class="btn btn-xs" type="button">关闭</button>
+    </div>
+
+    <div class="workspace">
+      <aside class="sidebar">
+        <div class="sidebar-head">
+          <div class="seg-group" id="chatTypeTabs">
+            <button type="button" class="seg active" data-type="all">全部</button>
+            <button type="button" class="seg" data-type="private">私聊</button>
+            <button type="button" class="seg" data-type="group">群聊</button>
+          </div>
+          <div class="sidebar-search">
+            <input id="chatQueryInput" type="search" placeholder="筛选备注 / 昵称 / 群名" />
+            <button id="refreshChatsBtn" class="btn btn-xs" type="button">刷新</button>
+          </div>
+          <div class="sidebar-select-bar">
+            <span id="checkedCountText" class="muted">已勾选 0 个（默认监控当前范围）</span>
+            <button id="clearCheckedBtn" class="btn btn-xs hidden" type="button">清空勾选</button>
+          </div>
+        </div>
+        <div id="chatList" class="chat-list"></div>
+      </aside>
+
+      <main class="main-panel">
+        <div class="toolbar">
+          <label class="field">
+            <span>范围</span>
+            <select id="watchModeSelect">
+              <option value="all">全部会话</option>
+              <option value="private">仅私聊</option>
+              <option value="group">仅群聊</option>
+              <option value="allowlist">仅已勾选会话</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>轮询</span>
+            <select id="watchIntervalSelect">
+              <option value="0.5">0.5 秒</option>
+              <option value="1.0" selected>1.0 秒</option>
+              <option value="2.0">2.0 秒</option>
+            </select>
+          </label>
+          <label class="checkbox-field">
+            <input id="watchIncludeSelf" type="checkbox" />
+            <span>包含自己发出</span>
+          </label>
+          <button id="clearFeedBtn" class="btn" type="button">清空屏显</button>
+          <span id="watchMetaInfo" class="muted"></span>
+        </div>
+
+        <div id="watchFeed" class="message-feed">
+          <div class="empty-state">
+            <p>已就绪，正在按最新消息水位实时监控新消息。</p>
+            <p class="muted">在左侧勾选特定私聊/群聊即可只盯选中会话；可发一条测试消息立即观察。</p>
+          </div>
+        </div>
+      </main>
+    </div>
+  </div>
+
+  <div id="tokenModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="tokenModalTitle">
+    <form id="tokenForm" class="modal-card">
+      <h3 id="tokenModalTitle">输入访问令牌</h3>
+      <p class="muted">当前服务启用了 --token 保护，请输入对应令牌：</p>
+      <input id="tokenInput" type="password" placeholder="输入 Token" required />
+      <div class="modal-actions">
+        <button class="btn btn-primary" type="submit">确认</button>
+      </div>
+    </form>
+  </div>
+
+  <script src="/assets/app.js"></script>
+</body>
+</html>
