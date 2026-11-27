@@ -252,6 +252,7 @@ def build_digest(
                         expected_md5=item.get("md5"),
                         file_ext=str(item.get("file_ext") or ""),
                         file_index=file_index,
+                        verify_md5=False,
                     )
                     attachments_out.append(
                         {
@@ -264,6 +265,12 @@ def build_digest(
                             "sender": sender_label,
                             "t": format_compact_time(ev.timestamp, ev.iso_time),
                             "seq": ev.sort_seq,
+                            "_hints": (
+                                ev.timestamp,
+                                str(item.get("file_ext") or ""),
+                                item.get("md5"),
+                                item.get("size_bytes"),
+                            ),
                         }
                     )
 
@@ -314,6 +321,24 @@ def build_digest(
 
     per_chat_out.sort(key=lambda c: c["signal_count"], reverse=True)
     attachments_out.sort(key=lambda a: (0 if a.get("available") else 1, -int(a.get("seq") or 0)))
+    for idx, entry in enumerate(attachments_out):
+        hints = entry.pop("_hints", None)
+        if idx < 30 and hints is not None and hints[2]:
+            ts_val, ext_val, md5_val, sz_val = hints
+            resolved = resolve_local_file(
+                repo.account.data_dir,
+                entry["filename"],
+                ts_val,
+                expected_size=sz_val,
+                expected_md5=md5_val,
+                file_ext=ext_val,
+                file_index=file_index,
+                verify_md5=True,
+            )
+            entry["available"] = resolved["available"]
+            entry["local_path"] = resolved["local_path"]
+            if sz_val is None:
+                entry["size_bytes"] = resolved.get("actual_size_bytes")
     kept_chats = per_chat_out[:max_chats_clamped]
     omitted_chats = max(0, len(per_chat_out) - len(kept_chats))
 

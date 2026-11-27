@@ -8,11 +8,14 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
 from tests.fixtures import SyntheticAccountEnv, make_file_xml, make_link_xml, make_quote_xml
+import wx_observer.attachments as attachments_mod
 from wx_observer.attachments import build_file_index, resolve_local_file
+from wx_observer.cipher_store import EncryptedDatabasePool, quick_check_sqlite
 from wx_observer.cli import main as cli_main
 from wx_observer.exceptions import WxObserverError
 from wx_observer.models import ChatInfo
@@ -716,6 +719,167 @@ def test_attachments_wave_early_stop(tmp_path) -> None:
         assert att["attachments"][0]["filename"] == "latest_wave.pdf"
     finally:
         service.close()
+
+
+def test_search_sql_prefilter_and_wave_exact_recall(tmp_path) -> None:
+    env = SyntheticAccountEnv(tmp_path / "wx")
+    now = int(time.time())
+    quote_amp = make_quote_xml(
+        "Check A & B spec",
+        ref_type=1,
+        ref_content="Spec",
+        display_name="AliceRemark",
+        from_usr=env.alice_id,
+    )
+    env.append_wal_messages(
+        env.alice_id,
+        [
+            (70, 1, 910, 3, now - 30, "Build Status GREEN"),
+            (71, 1, 920, 3, now - 20, "明天下午交作业"),
+            (72, (57 << 32) | 49, 930, 3, now - 10, quote_amp),
+        ],
+    )
+
+    service = ObserverService(
+        db_dir=str(env.db_dir),
+        keys_file=str(env.keys_file),
+        state_dir=tmp_path / "state",
+        temp_root=tmp_path / "pool",
+    )
+    try:
+        r_ascii = service.search_messages("build status green", since="24h", account=env.account_id)
+        assert r_ascii["count"] == 1 and r_ascii["messages"][0]["text"] == "Build Status GREEN"
+
+        r_cjk = service.search_messages("交作业", since="24h", account=env.account_id)
+        assert r_cjk["count"] == 1 and "交作业" in r_cjk["messages"][0]["text"]
+
+        r_zstd = service.search_messages("中文测试", since="24h", account=env.account_id)
+        assert r_zstd["count"] == 1 and "中文测试" in r_zstd["messages"][0]["text"]
+
+        r_amp = service.search_messages("A & B", since="24h", account=env.account_id)
+        assert r_amp["count"] == 1 and "A & B" in r_amp["messages"][0]["text"]
+
+        r_img = service.search_messages("[图片]", since="24h", account=env.account_id)
+        assert r_img["count"] >= 1 and any(m["msg_type"] == "image" for m in r_img["messages"])
+
+        # Wave early-stop across >32 chats
+        repo = service._repos[(env.account_id, None)]
+        real_chats = repo.list_chats(chat_type="all", limit=10, include_hidden=True, include_non_session=False)
+        filler_chats = [
+            ChatInfo(
+                chat_id=f"wxid_search_filler_{i}",
+                chat_type="private",
+                display_name=f"SearchFiller {i}",
+                last_timestamp=now - 7200 - i,
+            )
+            for i in range(40)
+        ]
+        orig_list = repo.list_chats
+        orig_batch = repo.get_messages_batch
+        wave_calls: list[int] = []
+
+        def stub_list(**_kwargs):
+            return [*real_chats, *filler_chats]
+
+        def spy_batch(chats, **kwargs):
+            wave_calls.append(len(chats))
+            return orig_batch(chats, **kwargs)
+
+        repo.list_chats = stub_list  # type: ignore[method-assign]
+        repo.get_messages_batch = spy_batch  # type: ignore[method-assign]
+        try:
+            wave_res = service.search_messages("交作业", since="24h", limit=1, account=env.account_id)
+        finally:
+            repo.list_chats = orig_list  # type: ignore[method-assign]
+            repo.get_messages_batch = orig_batch  # type: ignore[method-assign]
+
+        assert len(wave_calls) == 1
+        assert wave_calls[0] == 32
+        assert wave_res["count"] == 1 and "交作业" in wave_res["messages"][0]["text"]
+    finally:
+        service.close()
+
+
+def test_attachments_lazy_md5_only_hashes_top_limit(tmp_path, monkeypatch) -> None:
+    env = SyntheticAccountEnv(tmp_path / "wx")
+    now = int(time.time())
+    month_dir = env.db_dir / env.account_id / "msg" / "file" / time.strftime("%Y-%m")
+    month_dir.mkdir(parents=True, exist_ok=True)
+
+    rows = []
+    for i in range(1, 6):
+        fname = f"doc{i}.pdf"
+        payload = (f"DOC_DATA_{i}_").encode("ascii") * 64
+        md5_hex = hashlib.md5(payload).hexdigest()
+        (month_dir / fname).write_bytes(payload)
+        xml = (
+            f"<msg><appmsg><type>6</type><title>{fname}</title>"
+            f"<appattach><totallen>{len(payload)}</totallen><fileext>pdf</fileext>"
+            f"<md5>{md5_hex}</md5></appattach></appmsg></msg>"
+        )
+        rows.append((90 + i, (6 << 32) | 49, 950 + i, 3, now - (60 - i * 10), f"{env.alice_id}:\n{xml}"))
+    env.append_wal_messages(env.room_id, rows)
+
+    service = ObserverService(
+        db_dir=str(env.db_dir),
+        keys_file=str(env.keys_file),
+        state_dir=tmp_path / "state",
+        temp_root=tmp_path / "pool",
+    )
+    try:
+        orig_md5 = attachments_mod._file_md5
+        hashed_paths: list[str] = []
+
+        def spy_md5(path: Path):
+            hashed_paths.append(str(path))
+            return orig_md5(path)
+
+        monkeypatch.setattr(attachments_mod, "_file_md5", spy_md5)
+        attachments_mod._MD5_CACHE.clear()
+
+        res_all = service.list_attachments(
+            scope="all", since="24h", only_available=False, limit=2, account=env.account_id
+        )
+        assert res_all["count"] == 2
+        assert [x["filename"] for x in res_all["attachments"]] == ["doc5.pdf", "doc4.pdf"]
+        assert all(x["match_confidence"] == "md5" for x in res_all["attachments"])
+        assert len(hashed_paths) <= 2
+
+        hashed_paths.clear()
+        attachments_mod._MD5_CACHE.clear()
+        res_avail = service.list_attachments(
+            scope="all", since="24h", only_available=True, limit=2, account=env.account_id
+        )
+        assert res_avail["count"] == 2
+        assert res_avail["available_count"] == 2
+        assert [x["filename"] for x in res_avail["attachments"]] == ["doc5.pdf", "doc4.pdf"]
+        assert all(x["match_confidence"] == "md5" for x in res_avail["attachments"])
+        assert len(hashed_paths) <= 2
+    finally:
+        service.close()
+
+
+def test_parallel_prefetch_and_chunked_decrypt(tmp_path) -> None:
+    env = SyntheticAccountEnv(tmp_path / "wx")
+    pool = EncryptedDatabasePool(temp_root=tmp_path / "pool")
+    try:
+        db_files = {rel: env.storage_dir / rel for rel in env.keys_hex}
+        keys = {rel: bytes.fromhex(h) for rel, h in env.keys_hex.items()}
+        pool.register_databases(db_files, keys)
+        rels = sorted(db_files)
+        pool.prefetch_snapshots(rels)
+
+        gens = []
+        for rel in rels:
+            state = pool._snapshots.get(rel)
+            assert state is not None
+            assert state.snapshot_path.is_file()
+            assert quick_check_sqlite(state.snapshot_path)
+            gens.append(state.generation)
+        assert len(set(gens)) == len(rels)
+    finally:
+        pool.cleanup()
+
 
 
 

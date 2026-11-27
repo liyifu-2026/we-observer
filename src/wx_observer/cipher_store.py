@@ -16,8 +16,10 @@ import threading
 import time
 import uuid
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
 
 import psutil
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -100,17 +102,32 @@ def normalize_key_for_page1(key: bytes, page1: bytes) -> bytes | None:
     return None
 
 
+def _decrypt_page_fast(
+    algo: algorithms.AES,
+    page: bytes,
+    pgno: int,
+    use_plain_hdr: bool,
+    zeros_reserve: bytes,
+) -> bytes:
+    iv = page[IV_OFFSET : IV_OFFSET + 16]
+    decryptor = Cipher(algo, modes.CBC(iv)).decryptor()
+    if pgno == 1:
+        header = page[:16] if use_plain_hdr else SQLITE_HEADER
+        decrypted = decryptor.update(page[16:IV_OFFSET]) + decryptor.finalize()
+        return header + decrypted + zeros_reserve
+    decrypted = decryptor.update(page[:IV_OFFSET]) + decryptor.finalize()
+    return decrypted + zeros_reserve
+
+
 def decrypt_page(key: bytes, page: bytes, pgno: int) -> bytes:
     """Decrypt a single 4096-byte SQLCipher 4 page into standard SQLite page layout."""
-    enc_key = key[:32]
-    iv = page[IV_OFFSET : IV_OFFSET + 16]
-    decryptor = Cipher(algorithms.AES(enc_key), modes.CBC(iv)).decryptor()
-    if pgno == 1:
-        header = page[:16] if len(key) == 48 else SQLITE_HEADER
-        decrypted = decryptor.update(page[16:IV_OFFSET]) + decryptor.finalize()
-        return header + decrypted + (b"\x00" * RESERVE_SIZE)
-    decrypted = decryptor.update(page[:IV_OFFSET]) + decryptor.finalize()
-    return decrypted + (b"\x00" * RESERVE_SIZE)
+    return _decrypt_page_fast(
+        algorithms.AES(key[:32]),
+        page,
+        pgno,
+        len(key) == 48,
+        b"\x00" * RESERVE_SIZE,
+    )
 
 
 def quick_check_sqlite(db_path: Path) -> bool:
@@ -219,21 +236,34 @@ class EncryptedDatabasePool:
         return re.sub(r"[^A-Za-z0-9_.-]", "_", clean)
 
     def _next_generation_path(self, rel_path: str) -> tuple[int, Path]:
-        self._gen_counter += 1
+        with self._locks_guard:
+            self._gen_counter += 1
+            gen = self._gen_counter
         stem = self._safe_stem(rel_path)
-        return self._gen_counter, self._session_dir / f"{stem}.g{self._gen_counter}.db"
+        return gen, self._session_dir / f"{stem}.g{gen}.db"
 
     def _decrypt_main_file(self, src: Path, dst: Path, key: bytes) -> None:
-        size = src.stat().st_size
-        pages = (size + PAGE_SIZE - 1) // PAGE_SIZE
+        algo = algorithms.AES(key[:32])
+        use_plain_hdr = len(key) == 48
+        zeros_reserve = b"\x00" * RESERVE_SIZE
+        batch_bytes = 1024 * PAGE_SIZE
+        pgno = 0
         with src.open("rb") as fin, dst.open("wb") as fout:
-            for pgno in range(1, pages + 1):
-                raw = fin.read(PAGE_SIZE)
-                if not raw:
+            while True:
+                buf = fin.read(batch_bytes)
+                if not buf:
                     break
-                if len(raw) < PAGE_SIZE:
-                    raw = raw + (b"\x00" * (PAGE_SIZE - len(raw)))
-                fout.write(decrypt_page(key, raw, pgno))
+                buf_len = len(buf)
+                out_pages: list[bytes] = []
+                for off in range(0, buf_len, PAGE_SIZE):
+                    pgno += 1
+                    page = buf[off : off + PAGE_SIZE]
+                    if len(page) < PAGE_SIZE:
+                        page = page + (b"\x00" * (PAGE_SIZE - len(page)))
+                    out_pages.append(
+                        _decrypt_page_fast(algo, page, pgno, use_plain_hdr, zeros_reserve)
+                    )
+                fout.write(b"".join(out_pages))
 
     def _read_wal_meta(self, wal_path: Path) -> tuple[int, int, bytes, int]:
         if not wal_path.is_file():
@@ -402,9 +432,10 @@ class EncryptedDatabasePool:
         return state
 
     def _record_warning(self, msg: str) -> None:
-        if msg not in self._warnings:
-            self._warnings.append(msg)
-            logger.warning("%s", msg)
+        with self._locks_guard:
+            if msg not in self._warnings:
+                self._warnings.append(msg)
+                logger.warning("%s", msg)
 
     def ensure_snapshot(self, rel_path: str, force_rebuild: bool = False) -> Path:
         if self._closed:
@@ -482,6 +513,48 @@ class EncryptedDatabasePool:
 
             state = self._build_full_snapshot(rel_path, src, key)
             return state.snapshot_path
+
+    def _needs_refresh(self, rel_path: str, force_rebuild: bool) -> bool:
+        if rel_path not in self._paths or rel_path not in self._keys:
+            return False
+        if force_rebuild:
+            return True
+        src = self._paths[rel_path]
+        wal_path = Path(str(src) + "-wal")
+        with self._lock_for(rel_path):
+            prev = self._snapshots.get(rel_path)
+            if prev is None or not prev.snapshot_path.is_file():
+                return True
+            try:
+                st = src.stat()
+                src_mtime_ns, src_size = st.st_mtime_ns, st.st_size
+            except OSError:
+                return True
+            wal_mtime_ns, wal_size, _salt, _frames = self._read_wal_meta(wal_path)
+            return not (
+                src_mtime_ns == prev.src_mtime_ns
+                and src_size == prev.src_size
+                and wal_mtime_ns == prev.wal_mtime_ns
+                and wal_size == prev.wal_size
+            )
+
+    def prefetch_snapshots(
+        self,
+        rel_paths: Sequence[str],
+        *,
+        force_rebuild: bool = False,
+    ) -> None:
+        """Warm multiple database snapshots concurrently when 2+ targets need refresh."""
+        if self._closed:
+            raise RuntimeError("EncryptedDatabasePool is already closed.")
+        unique_rels = list(dict.fromkeys(rel_paths))
+        pending = [rel for rel in unique_rels if self._needs_refresh(rel, force_rebuild)]
+        if len(pending) < 2:
+            return
+        with ThreadPoolExecutor(max_workers=min(4, len(pending))) as executor:
+            futures = [executor.submit(self.ensure_snapshot, rel, force_rebuild) for rel in pending]
+            for fut in futures:
+                fut.result()
 
     def open_readonly(self, rel_path: str, force_rebuild: bool = False) -> sqlite3.Connection:
         snap = self.ensure_snapshot(rel_path, force_rebuild=force_rebuild)

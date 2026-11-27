@@ -433,12 +433,6 @@ def parse_message_row(
     raw_type = int(local_type or 0)
     base_type = raw_type & 0xFFFFFFFF
 
-    primary = decode_payload(message_content)
-    secondary = decode_payload(compress_content) if not primary and compress_content else ""
-    body = primary or secondary
-    if is_group and body:
-        body = strip_group_sender_prefix(body, sender_id)
-
     if raw_type == 8594229559345:
         return ParsedMessage(
             msg_type="red_packet",
@@ -447,6 +441,30 @@ def parse_message_row(
             quote=None,
             metadata={},
         )
+
+    if base_type in (47, 11000):
+        return ParsedMessage(
+            msg_type="emoji",
+            raw_type=raw_type,
+            text="[动画表情]",
+            quote=None,
+            metadata={},
+        )
+
+    if base_type == 50:
+        return ParsedMessage(
+            msg_type="voip",
+            raw_type=raw_type,
+            text="[音视频通话]",
+            quote=None,
+            metadata={},
+        )
+
+    primary = decode_payload(message_content)
+    secondary = decode_payload(compress_content) if not primary and compress_content else ""
+    body = primary or secondary
+    if is_group and body:
+        body = strip_group_sender_prefix(body, sender_id)
 
     if base_type == 1:
         if not body and compress_content:
@@ -515,15 +533,6 @@ def parse_message_row(
             metadata=meta,
         )
 
-    if base_type in (47, 11000):
-        return ParsedMessage(
-            msg_type="emoji",
-            raw_type=raw_type,
-            text="[动画表情]",
-            quote=None,
-            metadata={},
-        )
-
     if base_type == 48:
         meta = {}
         label = ""
@@ -563,15 +572,6 @@ def parse_message_row(
             msg_type="card",
             raw_type=raw_type,
             text="[卡片/应用消息]",
-            quote=None,
-            metadata={},
-        )
-
-    if base_type == 50:
-        return ParsedMessage(
-            msg_type="voip",
-            raw_type=raw_type,
-            text="[音视频通话]",
             quote=None,
             metadata={},
         )

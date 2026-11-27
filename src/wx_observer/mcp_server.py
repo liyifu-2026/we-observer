@@ -60,7 +60,7 @@ def create_mcp_server(
     """Create a read-only MCPServer exposing account discovery, history, digests, attachments, and live watching."""
     server = MCPServer(
         name=name,
-        version="0.3.0",
+        version="0.3.1",
         instructions=(
             "Read-only Windows WeChat 4.x local observer. "
             "Use list_accounts and select_account (or pass explicit account='...' per call without mutating global state). "

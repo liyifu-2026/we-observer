@@ -560,6 +560,8 @@ class AccountRepository:
             force_rebuild = attempt == 1
             matched: list[tuple[sqlite3.Connection, str, str]] = []
             try:
+                if len(shard_rels) >= 2:
+                    self.pool.prefetch_snapshots(shard_rels, force_rebuild=force_rebuild)
                 matching_rels = [
                     rel
                     for rel in shard_rels
@@ -721,6 +723,7 @@ class AccountRepository:
         since_ts: int | None = None,
         until_ts: int | None = None,
         msg_types: list[str] | None = None,
+        keyword: str | None = None,
     ) -> tuple[str, list[Any]]:
         clauses: list[str] = []
         params: list[Any] = []
@@ -762,6 +765,48 @@ class AccountRepository:
                 sub_placeholders = ", ".join("?" for _ in sub_codes)
                 clauses.append(f"(local_type >> 32) IN ({sub_placeholders})")
                 params.extend(sub_codes)
+
+        if keyword:
+            kw = keyword.strip()
+            if kw and all(ch.isascii() or ch.lower() == ch.upper() for ch in kw):
+                escaped = kw.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                pattern = f"%{escaped}%"
+                kw_cf = kw.casefold()
+                has_synth_kw = any(
+                    tok in kw_cf
+                    for tok in (
+                        "[",
+                        "图片",
+                        "语音",
+                        "视频",
+                        "表情",
+                        "位置",
+                        "文件",
+                        "链接",
+                        "小程序",
+                        "聊天记录",
+                        "转账",
+                        "红包",
+                        "卡片",
+                        "通话",
+                        "系统",
+                        "消息",
+                    )
+                )
+                has_xml_char = any(ch in kw for ch in "&<>'\"")
+                blob_or_like = (
+                    "(typeof(message_content) = 'blob' "
+                    "OR typeof(compress_content) = 'blob' "
+                    "OR message_content LIKE ? ESCAPE '\\' "
+                    "OR compress_content LIKE ? ESCAPE '\\')"
+                )
+                if not has_synth_kw and not has_xml_char:
+                    clauses.append(
+                        f"((local_type & 4294967295) NOT IN (3, 34, 43, 47, 11000, 50) AND {blob_or_like})"
+                    )
+                else:
+                    clauses.append(f"((local_type & 4294967295) != 1 OR {blob_or_like})")
+                params.extend([pattern, pattern])
 
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         return where_sql, params
@@ -844,6 +889,7 @@ class AccountRepository:
             since_ts=since_ts,
             until_ts=until_ts,
             msg_types=msg_types,
+            keyword=keyword,
         )
         has_post_filter = bool(msg_types or sender or keyword or not include_self)
         ascending_fetch = after_seq is not None and before_seq is None
@@ -939,6 +985,7 @@ class AccountRepository:
         since_ts: int | None = None,
         until_ts: int | None = None,
         msg_types: list[str] | None = None,
+        keyword: str | None = None,
         include_self: bool = True,
     ) -> dict[str, list[MessageEvent]]:
         """Fetch latest messages across multiple chats by opening each matching shard at most once."""
@@ -963,8 +1010,9 @@ class AccountRepository:
             since_ts=since_ts,
             until_ts=until_ts,
             msg_types=msg_types,
+            keyword=keyword,
         )
-        has_post_filter = bool(msg_types or not include_self)
+        has_post_filter = bool(msg_types or keyword or not include_self)
         per_shard_cap = None if has_post_filter else (limit_per_chat + 1)
         limit_sql = f" LIMIT {per_shard_cap}" if per_shard_cap is not None else ""
         order_sql = "ORDER BY sort_seq DESC, local_id ASC"
@@ -973,6 +1021,8 @@ class AccountRepository:
             force_rebuild = attempt == 1
             per_chat_raw: dict[str, list[MessageEvent]] = {cid: [] for cid in unique_chats}
             try:
+                if len(shard_rels) >= 2:
+                    self.pool.prefetch_snapshots(shard_rels, force_rebuild=force_rebuild)
                 for rel in shard_rels:
                     shard_tables = self._get_shard_tables(rel, force_rebuild=force_rebuild)
                     matching_tables = [tbl for tbl in table_to_chat if tbl in shard_tables]
@@ -1002,6 +1052,7 @@ class AccountRepository:
                                     own_display=own_display,
                                     contacts=contacts,
                                     msg_types=msg_types,
+                                    keyword=keyword,
                                     include_self=include_self,
                                 )
                             )
@@ -1054,20 +1105,38 @@ class AccountRepository:
             include_hidden=True,
             include_non_session=(since_ts is None),
         )
+        eligible_chats = [
+            chat
+            for chat in chats
+            if since_ts is None or (chat.last_timestamp > 0 and chat.last_timestamp >= since_ts - 60)
+        ]
+        use_waves = since_ts is not None
+        if use_waves:
+            eligible_chats.sort(key=lambda c: c.last_timestamp, reverse=True)
+            wave_size = max(32, min(limit * 2, 80))
+        else:
+            wave_size = max(1, len(eligible_chats))
+
         hits: list[MessageEvent] = []
-        for chat in chats:
-            if since_ts is not None and (chat.last_timestamp <= 0 or chat.last_timestamp < since_ts - 60):
-                continue
-            res = self.get_messages(
-                chat.chat_id,
-                chat_name=chat.display_name,
-                limit=limit,
+        offset = 0
+        while offset < len(eligible_chats):
+            chunk = eligible_chats[offset : offset + wave_size]
+            offset += len(chunk)
+            batch_by_chat = self.get_messages_batch(
+                chunk,
+                limit_per_chat=limit,
                 since_ts=since_ts,
                 until_ts=until_ts,
                 keyword=keyword,
                 include_self=True,
             )
-            hits.extend(res["messages"])
+            for chat in chunk:
+                hits.extend(batch_by_chat.get(chat.chat_id, ()))
+            if use_waves and offset < len(eligible_chats) and len(hits) >= limit:
+                hits.sort(key=lambda e: (e.timestamp, e.sort_seq, e.chat_id, e.local_id), reverse=True)
+                if hits[limit - 1].timestamp > eligible_chats[offset].last_timestamp + 60:
+                    break
+
         hits.sort(key=lambda e: (e.timestamp, e.sort_seq, e.chat_id, e.local_id), reverse=True)
         chosen = hits[:limit]
         chosen.sort(key=lambda e: (e.timestamp, e.sort_seq, e.chat_id, e.local_id))
@@ -1179,6 +1248,8 @@ class AccountRepository:
         for attempt in (0, 1):
             conns: list[sqlite3.Connection] = []
             try:
+                if len(shard_rels) >= 2:
+                    self.pool.prefetch_snapshots(shard_rels, force_rebuild=(attempt == 1))
                 max_seqs = {}
                 for rel in shard_rels:
                     conn = self.pool.open_readonly(rel, force_rebuild=(attempt == 1))

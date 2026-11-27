@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -15,6 +16,10 @@ from wx_observer.shaping import estimate_tokens, format_compact_time
 _INVALID_WIN_CHARS_RE = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 _YYYY_MM_RE = re.compile(r"^\d{4}-\d{2}$")
 _MAX_HASH_BYTES = 50 * 1024 * 1024
+_MD5_CHUNK_BYTES = 1_048_576
+_MD5_CACHE_MAX = 2048
+_MD5_CACHE_LOCK = threading.Lock()
+_MD5_CACHE: dict[tuple[str, int, int], str] = {}
 
 
 def _month_candidates(timestamp: int) -> list[str]:
@@ -33,13 +38,27 @@ def _month_candidates(timestamp: int) -> list[str]:
 
 def _file_md5(path: Path) -> str | None:
     try:
-        if path.stat().st_size > _MAX_HASH_BYTES:
+        st = path.stat()
+        if st.st_size > _MAX_HASH_BYTES:
             return None
+        cache_key = (str(path), st.st_mtime_ns, st.st_size)
+        with _MD5_CACHE_LOCK:
+            cached = _MD5_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
         digest = hashlib.md5()
         with path.open("rb") as f:
-            for chunk in iter(lambda: f.read(65536), b""):
+            while True:
+                chunk = f.read(_MD5_CHUNK_BYTES)
+                if not chunk:
+                    break
                 digest.update(chunk)
-        return digest.hexdigest().lower()
+        hex_digest = digest.hexdigest().lower()
+        with _MD5_CACHE_LOCK:
+            if len(_MD5_CACHE) >= _MD5_CACHE_MAX:
+                _MD5_CACHE.pop(next(iter(_MD5_CACHE)))
+            _MD5_CACHE[cache_key] = hex_digest
+        return hex_digest
     except OSError:
         return None
 
@@ -116,13 +135,11 @@ def build_file_index(account_data_dir: str | Path) -> LocalFileIndex:
                         rdir = Path(entry.path).resolve()
                         if rdir.is_relative_to(resolved_root):
                             months.append((entry.name, rdir))
-                    elif entry.is_file(follow_symlinks=False):
-                        rpath = Path(entry.path).resolve()
-                        if rpath.is_relative_to(resolved_root):
-                            size = entry.stat(follow_symlinks=False).st_size
-                            by_name_ci.setdefault(entry.name.casefold(), []).append(
-                                ("", rpath, size)
-                            )
+                    elif entry.is_file(follow_symlinks=False) and not entry.is_symlink():
+                        size = entry.stat(follow_symlinks=False).st_size
+                        by_name_ci.setdefault(entry.name.casefold(), []).append(
+                            ("", resolved_root / entry.name, size)
+                        )
                 except OSError:
                     continue
     except OSError:
@@ -139,14 +156,12 @@ def build_file_index(account_data_dir: str | Path) -> LocalFileIndex:
             with os.scandir(mdir) as it:
                 for entry in it:
                     try:
-                        if not entry.is_file(follow_symlinks=False):
+                        if not entry.is_file(follow_symlinks=False) or entry.is_symlink():
                             continue
-                        rpath = Path(entry.path).resolve()
-                        if rpath.is_relative_to(resolved_root):
-                            size = entry.stat(follow_symlinks=False).st_size
-                            by_name_ci.setdefault(entry.name.casefold(), []).append(
-                                (ym, rpath, size)
-                            )
+                        size = entry.stat(follow_symlinks=False).st_size
+                        by_name_ci.setdefault(entry.name.casefold(), []).append(
+                            (ym, mdir / entry.name, size)
+                        )
                     except OSError:
                         continue
         except OSError:
@@ -240,6 +255,18 @@ def _iter_direct_hits(
             yield target, actual_size, is_suffix
 
 
+def _resolve_within_root(target: Path, resolved_root: Path | None) -> Path | None:
+    if resolved_root is None:
+        return target
+    try:
+        resolved = target.resolve()
+        if resolved.is_relative_to(resolved_root):
+            return resolved
+    except OSError:
+        pass
+    return None
+
+
 def resolve_local_file(
     account_data_dir: str | Path,
     filename: str,
@@ -249,6 +276,7 @@ def resolve_local_file(
     expected_md5: str | None = None,
     file_ext: str = "",
     file_index: LocalFileIndex | None = None,
+    verify_md5: bool = True,
 ) -> dict[str, Any]:
     """Locate a downloaded plaintext attachment under <account_data_dir>/msg/file/."""
     if _is_unsafe_filename(filename):
@@ -270,6 +298,7 @@ def resolve_local_file(
                 "match_confidence": None,
                 "reason": "file_root_missing",
             }
+        check_root: Path | None = file_index.resolved_root
         hit_iter = _iter_indexed_hits(file_index, candidates, timestamp)
     else:
         file_root = Path(account_data_dir) / "msg" / "file"
@@ -281,69 +310,51 @@ def resolve_local_file(
                 "match_confidence": None,
                 "reason": "file_root_missing",
             }
+        check_root = None
         hit_iter = _iter_direct_hits(file_root, candidates, timestamp)
 
-    norm_md5 = expected_md5.strip().lower() if expected_md5 else None
-    matches: list[tuple[int, dict[str, Any]]] = []
+    norm_md5 = expected_md5.strip().lower() if (verify_md5 and expected_md5) else None
+    matches: list[tuple[int, Path, int, str]] = []
 
     for target, actual_size, is_suffix in hit_iter:
         if norm_md5 and (expected_size is None or actual_size == expected_size):
-            if _file_md5(target) == norm_md5:
+            safe_target = _resolve_within_root(target, check_root)
+            if safe_target is not None and _file_md5(safe_target) == norm_md5:
                 return {
                     "available": True,
-                    "local_path": str(target),
+                    "local_path": str(safe_target),
                     "actual_size_bytes": actual_size,
                     "match_confidence": "md5",
                 }
 
         size_match = expected_size is not None and actual_size == expected_size
         if not is_suffix and size_match:
-            return {
-                "available": True,
-                "local_path": str(target),
-                "actual_size_bytes": actual_size,
-                "match_confidence": "name_and_size",
-            }
+            safe_target = _resolve_within_root(target, check_root)
+            if safe_target is not None:
+                return {
+                    "available": True,
+                    "local_path": str(safe_target),
+                    "actual_size_bytes": actual_size,
+                    "match_confidence": "name_and_size",
+                }
         if not is_suffix:
-            matches.append(
-                (
-                    2,
-                    {
-                        "available": True,
-                        "local_path": str(target),
-                        "actual_size_bytes": actual_size,
-                        "match_confidence": "name",
-                    },
-                )
-            )
+            matches.append((2, target, actual_size, "name"))
         elif size_match:
-            matches.append(
-                (
-                    1,
-                    {
-                        "available": True,
-                        "local_path": str(target),
-                        "actual_size_bytes": actual_size,
-                        "match_confidence": "suffix_and_size",
-                    },
-                )
-            )
+            matches.append((1, target, actual_size, "suffix_and_size"))
         else:
-            matches.append(
-                (
-                    3,
-                    {
-                        "available": True,
-                        "local_path": str(target),
-                        "actual_size_bytes": actual_size,
-                        "match_confidence": "suffix",
-                    },
-                )
-            )
+            matches.append((3, target, actual_size, "suffix"))
 
     if matches:
         matches.sort(key=lambda item: item[0])
-        return matches[0][1]
+        for _rank, target, actual_size, confidence in matches:
+            safe_target = _resolve_within_root(target, check_root)
+            if safe_target is not None:
+                return {
+                    "available": True,
+                    "local_path": str(safe_target),
+                    "actual_size_bytes": actual_size,
+                    "match_confidence": confidence,
+                }
 
     return {
         "available": False,
@@ -446,27 +457,38 @@ def collect_attachments(
                     ext = str(item.get("file_ext") or "").lower().lstrip(".")
                     if norm_exts and ext not in norm_exts:
                         continue
-                    resolved = resolve_local_file(
-                        repo.account.data_dir,
-                        item["filename"],
-                        ev.timestamp,
-                        expected_size=item.get("size_bytes"),
-                        expected_md5=item.get("md5"),
-                        file_ext=ext,
-                        file_index=file_index,
-                    )
-                    if only_available and not resolved["available"]:
-                        continue
+                    if only_available:
+                        resolved = resolve_local_file(
+                            repo.account.data_dir,
+                            item["filename"],
+                            ev.timestamp,
+                            expected_size=item.get("size_bytes"),
+                            expected_md5=item.get("md5"),
+                            file_ext=ext,
+                            file_index=file_index,
+                            verify_md5=False,
+                        )
+                        if not resolved["available"]:
+                            continue
+                        avail = True
+                        local_path = resolved["local_path"]
+                        confidence = resolved.get("match_confidence")
+                        size_bytes = item.get("size_bytes") or resolved.get("actual_size_bytes")
+                    else:
+                        avail = False
+                        local_path = None
+                        confidence = None
+                        size_bytes = item.get("size_bytes")
                     found.append(
                         {
                             "filename": item["filename"],
                             "file_ext": ext,
-                            "size_bytes": item.get("size_bytes") or resolved.get("actual_size_bytes"),
+                            "size_bytes": size_bytes,
                             "md5": item.get("md5"),
                             "source_type": item["source_type"],
-                            "available": resolved["available"],
-                            "local_path": resolved["local_path"],
-                            "match_confidence": resolved.get("match_confidence"),
+                            "available": avail,
+                            "local_path": local_path,
+                            "match_confidence": confidence,
                             "t": format_compact_time(ev.timestamp, ev.iso_time),
                             "timestamp": ev.timestamp,
                             "chat": chat.display_name,
@@ -483,6 +505,26 @@ def collect_attachments(
 
     found.sort(key=lambda r: (r["timestamp"], r["seq"], r["chat_id"]), reverse=True)
     trimmed = found[:limit]
+    for entry in trimmed:
+        if only_available and not entry.get("md5"):
+            continue
+        resolved = resolve_local_file(
+            repo.account.data_dir,
+            entry["filename"],
+            entry["timestamp"],
+            expected_size=entry.get("size_bytes"),
+            expected_md5=entry.get("md5"),
+            file_ext=entry.get("file_ext") or "",
+            file_index=file_index,
+            verify_md5=True,
+        )
+        entry["available"] = resolved["available"]
+        entry["local_path"] = resolved["local_path"]
+        entry["match_confidence"] = resolved.get("match_confidence")
+        if entry["size_bytes"] is None:
+            entry["size_bytes"] = resolved.get("actual_size_bytes")
+    if only_available:
+        trimmed = [item for item in trimmed if item["available"]]
     available_count = sum(1 for item in trimmed if item["available"])
     payload: dict[str, Any] = {
         "ok": True,
