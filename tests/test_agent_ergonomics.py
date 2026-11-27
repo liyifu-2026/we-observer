@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -14,6 +15,7 @@ from tests.fixtures import SyntheticAccountEnv, make_file_xml, make_link_xml, ma
 from wx_observer.attachments import build_file_index, resolve_local_file
 from wx_observer.cli import main as cli_main
 from wx_observer.exceptions import WxObserverError
+from wx_observer.models import ChatInfo
 from wx_observer.service import ObserverService, parse_timestamp
 
 
@@ -564,5 +566,157 @@ def test_64bit_subtype_sql_pushdown_and_file_index(tmp_path) -> None:
         file_index=idx,
     )
     assert r_evil["available"] is False and r_evil["local_path"] is None
+
+
+def test_get_messages_batch_single_pass_and_digest_budget(tmp_path) -> None:
+    env = SyntheticAccountEnv(tmp_path / "wx")
+    now = int(time.time())
+    extra_rows = [
+        (70 + i, 1, 950 + i, 3, now - (100 - i), f"High volume discussion point #{i} https://example.org/p/{i}")
+        for i in range(6)
+    ]
+    env.append_wal_messages(env.room_id, extra_rows)
+
+    service = ObserverService(
+        db_dir=str(env.db_dir),
+        keys_file=str(env.keys_file),
+        state_dir=tmp_path / "state",
+        temp_root=tmp_path / "pool",
+    )
+    try:
+        sel = service.select_account(account=env.account_id)
+        assert sel["ok"] is True
+        repo = service._repos[(env.account_id, None)]
+
+        # Warm shard table index first
+        chats = repo.list_chats(chat_type="all", limit=10, include_hidden=False)
+        assert len(chats) == 2
+
+        orig_open = repo.pool.open_readonly
+        opened_rels: list[str] = []
+
+        def tracked_open(rel: str, *, force_rebuild: bool = False):
+            opened_rels.append(rel)
+            return orig_open(rel, force_rebuild=force_rebuild)
+
+        # Warm table cache cleanly via one batch call, then assert single-open-per-shard on repeated call
+        first_batch = repo.get_messages_batch(chats, limit_per_chat=50)
+        assert len(first_batch[env.alice_id]) == 5
+        assert len(first_batch[env.room_id]) == 10
+
+        repo.pool.open_readonly = tracked_open  # type: ignore[method-assign]
+        try:
+            opened_rels.clear()
+            batch = repo.get_messages_batch(chats, limit_per_chat=50)
+            assert len(batch[env.alice_id]) == 5
+            assert len(batch[env.room_id]) == 10
+            assert opened_rels.count("message/message_0.db") <= 1
+            assert opened_rels.count("message/message_1.db") <= 1
+        finally:
+            repo.pool.open_readonly = orig_open  # type: ignore[method-assign]
+
+        unbounded = service.digest(scope="all", since="24h", token_budget=0, account=env.account_id)
+        assert unbounded["est_tokens"] > 500
+        assert unbounded["summary"]["budget_trimmed"] is False
+
+        capped = service.digest(
+            scope="all",
+            since="24h",
+            max_chats=1,
+            token_budget=350,
+            account=env.account_id,
+        )
+        assert len(capped["per_chat"]) == 1
+        assert capped["summary"]["omitted_chats"] >= 1
+        assert capped["summary"]["budget_trimmed"] is True
+        assert capped["summary"]["active_chats"] >= 2
+        assert capped["summary"]["total_messages"] >= 15
+        assert capped["est_tokens"] <= 400
+    finally:
+        service.close()
+
+
+def test_cli_ui_removed_and_mcp_extra_error(tmp_path, monkeypatch, capsys) -> None:
+    with pytest.raises(SystemExit) as exc_ui:
+        cli_main(["ui"])
+    assert exc_ui.value.code != 0
+    capsys.readouterr()
+
+    monkeypatch.setitem(sys.modules, "wx_observer.mcp_server", None)
+    rc = cli_main(["--state-dir", str(tmp_path / "cli_state"), "mcp", "--transport", "stdio"])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "mcp_not_installed" in err
+    assert ".[mcp]" in err
+
+
+def test_attachments_wave_early_stop(tmp_path) -> None:
+    env = SyntheticAccountEnv(tmp_path / "wx")
+    now = int(time.time())
+    month_dir = env.db_dir / env.account_id / "msg" / "file" / time.strftime("%Y-%m")
+    month_dir.mkdir(parents=True, exist_ok=True)
+    (month_dir / "latest_wave.pdf").write_bytes(b"W" * 2048)
+    env.append_wal_messages(
+        env.room_id,
+        [(80, (6 << 32) | 49, 999, 3, now - 5, f"{env.alice_id}:\n{make_file_xml('latest_wave.pdf', 2048, ext='pdf')}")],
+    )
+
+    service = ObserverService(
+        db_dir=str(env.db_dir),
+        keys_file=str(env.keys_file),
+        state_dir=tmp_path / "state",
+        temp_root=tmp_path / "pool",
+    )
+    try:
+        sel = service.select_account(account=env.account_id)
+        assert sel["ok"] is True
+        repo = service._repos[(env.account_id, None)]
+
+        real_chats = repo.list_chats(chat_type="all", limit=10, include_hidden=True, include_non_session=False)
+        filler_chats = [
+            ChatInfo(
+                chat_id=f"wxid_filler_{i}",
+                chat_type="private",
+                display_name=f"Filler {i}",
+                last_timestamp=now - 7200 - i,
+            )
+            for i in range(40)
+        ]
+
+        orig_list = repo.list_chats
+        orig_batch = repo.get_messages_batch
+        wave_calls: list[int] = []
+
+        def stub_list_chats(**_kwargs):
+            return [*real_chats, *filler_chats]
+
+        def spy_batch(chats, **kwargs):
+            wave_calls.append(len(chats))
+            return orig_batch(chats, **kwargs)
+
+        repo.list_chats = stub_list_chats  # type: ignore[method-assign]
+        repo.get_messages_batch = spy_batch  # type: ignore[method-assign]
+        try:
+            att = service.list_attachments(
+                scope="all",
+                since="24h",
+                extensions=["pdf"],
+                only_available=True,
+                limit=1,
+                account=env.account_id,
+            )
+        finally:
+            repo.list_chats = orig_list  # type: ignore[method-assign]
+            repo.get_messages_batch = orig_batch  # type: ignore[method-assign]
+
+        assert len(wave_calls) == 1
+        assert wave_calls[0] == 32
+        assert att["count"] == 1
+        assert att["available_count"] == 1
+        assert att["attachments"][0]["filename"] == "latest_wave.pdf"
+    finally:
+        service.close()
+
+
 
 

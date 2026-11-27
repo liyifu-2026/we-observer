@@ -386,84 +386,100 @@ def collect_attachments(
         )
 
     file_index = build_file_index(repo.account.data_dir)
+    eligible_chats = [
+        chat
+        for chat in target_chats
+        if explicit_chats
+        or since_ts is None
+        or (chat.last_timestamp > 0 and chat.last_timestamp >= since_ts - 60)
+    ]
+    use_waves = (not explicit_chats) and (since_ts is not None)
+    if use_waves:
+        eligible_chats.sort(key=lambda c: c.last_timestamp, reverse=True)
+        wave_size = max(32, min(limit * 2, 80))
+    else:
+        wave_size = max(1, len(eligible_chats))
+
     found: list[dict[str, Any]] = []
-    for chat in target_chats:
-        if (
-            not explicit_chats
-            and since_ts is not None
-            and (chat.last_timestamp <= 0 or chat.last_timestamp < since_ts - 60)
-        ):
-            continue
-        res = repo.get_messages(
-            chat.chat_id,
-            chat_name=chat.display_name,
-            limit=500,
+    offset = 0
+    while offset < len(eligible_chats):
+        chunk = eligible_chats[offset : offset + wave_size]
+        offset += len(chunk)
+        batch_by_chat = repo.get_messages_batch(
+            chunk,
+            limit_per_chat=500,
             since_ts=since_ts,
             until_ts=until_ts,
             msg_types=["file", "chat_history"],
             include_self=True,
         )
-        for ev in res["messages"]:
-            file_items: list[dict[str, Any]] = []
-            if ev.msg_type == "file":
-                fname = str(ev.metadata.get("filename") or "").strip()
-                if fname:
-                    file_items.append(
-                        {
-                            "filename": fname,
-                            "size_bytes": ev.metadata.get("size_bytes"),
-                            "file_ext": ev.metadata.get("file_ext") or Path(fname).suffix.lstrip(".").lower(),
-                            "md5": ev.metadata.get("md5"),
-                            "source_type": "file",
-                        }
-                    )
-            elif ev.msg_type == "chat_history":
-                for emb in ev.metadata.get("embedded_files") or ():
-                    fname = str(emb.get("filename") or "").strip()
+        for chat in chunk:
+            for ev in batch_by_chat.get(chat.chat_id, ()):
+                file_items: list[dict[str, Any]] = []
+                if ev.msg_type == "file":
+                    fname = str(ev.metadata.get("filename") or "").strip()
                     if fname:
                         file_items.append(
                             {
                                 "filename": fname,
-                                "size_bytes": emb.get("size_bytes"),
-                                "file_ext": emb.get("file_ext") or Path(fname).suffix.lstrip(".").lower(),
-                                "md5": emb.get("md5"),
-                                "source_type": "forwarded_record",
+                                "size_bytes": ev.metadata.get("size_bytes"),
+                                "file_ext": ev.metadata.get("file_ext") or Path(fname).suffix.lstrip(".").lower(),
+                                "md5": ev.metadata.get("md5"),
+                                "source_type": "file",
                             }
                         )
+                elif ev.msg_type == "chat_history":
+                    for emb in ev.metadata.get("embedded_files") or ():
+                        fname = str(emb.get("filename") or "").strip()
+                        if fname:
+                            file_items.append(
+                                {
+                                    "filename": fname,
+                                    "size_bytes": emb.get("size_bytes"),
+                                    "file_ext": emb.get("file_ext") or Path(fname).suffix.lstrip(".").lower(),
+                                    "md5": emb.get("md5"),
+                                    "source_type": "forwarded_record",
+                                }
+                            )
 
-            for item in file_items:
-                ext = str(item.get("file_ext") or "").lower().lstrip(".")
-                if norm_exts and ext not in norm_exts:
-                    continue
-                resolved = resolve_local_file(
-                    repo.account.data_dir,
-                    item["filename"],
-                    ev.timestamp,
-                    expected_size=item.get("size_bytes"),
-                    expected_md5=item.get("md5"),
-                    file_ext=ext,
-                    file_index=file_index,
-                )
-                if only_available and not resolved["available"]:
-                    continue
-                found.append(
-                    {
-                        "filename": item["filename"],
-                        "file_ext": ext,
-                        "size_bytes": item.get("size_bytes") or resolved.get("actual_size_bytes"),
-                        "md5": item.get("md5"),
-                        "source_type": item["source_type"],
-                        "available": resolved["available"],
-                        "local_path": resolved["local_path"],
-                        "match_confidence": resolved.get("match_confidence"),
-                        "t": format_compact_time(ev.timestamp, ev.iso_time),
-                        "timestamp": ev.timestamp,
-                        "chat": chat.display_name,
-                        "chat_id": chat.chat_id,
-                        "sender": ev.sender_name or ev.sender_id or ("我" if ev.is_self else ""),
-                        "seq": ev.sort_seq,
-                    }
-                )
+                for item in file_items:
+                    ext = str(item.get("file_ext") or "").lower().lstrip(".")
+                    if norm_exts and ext not in norm_exts:
+                        continue
+                    resolved = resolve_local_file(
+                        repo.account.data_dir,
+                        item["filename"],
+                        ev.timestamp,
+                        expected_size=item.get("size_bytes"),
+                        expected_md5=item.get("md5"),
+                        file_ext=ext,
+                        file_index=file_index,
+                    )
+                    if only_available and not resolved["available"]:
+                        continue
+                    found.append(
+                        {
+                            "filename": item["filename"],
+                            "file_ext": ext,
+                            "size_bytes": item.get("size_bytes") or resolved.get("actual_size_bytes"),
+                            "md5": item.get("md5"),
+                            "source_type": item["source_type"],
+                            "available": resolved["available"],
+                            "local_path": resolved["local_path"],
+                            "match_confidence": resolved.get("match_confidence"),
+                            "t": format_compact_time(ev.timestamp, ev.iso_time),
+                            "timestamp": ev.timestamp,
+                            "chat": chat.display_name,
+                            "chat_id": chat.chat_id,
+                            "sender": ev.sender_name or ev.sender_id or ("我" if ev.is_self else ""),
+                            "seq": ev.sort_seq,
+                        }
+                    )
+
+        if use_waves and offset < len(eligible_chats) and len(found) >= limit:
+            found.sort(key=lambda r: (r["timestamp"], r["seq"], r["chat_id"]), reverse=True)
+            if found[limit - 1]["timestamp"] > eligible_chats[offset].last_timestamp + 60:
+                break
 
     found.sort(key=lambda r: (r["timestamp"], r["seq"], r["chat_id"]), reverse=True)
     trimmed = found[:limit]

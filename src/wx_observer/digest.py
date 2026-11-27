@@ -46,6 +46,69 @@ def _highlight_score(ev: MessageEvent) -> tuple[int, int, int]:
     return (priority, len(ev.text or ""), ev.timestamp)
 
 
+def _apply_digest_budget(result: dict[str, Any], token_budget: int) -> None:
+    """Enforce output est_tokens <= token_budget (when > 0) while preserving global summary counts."""
+    est = estimate_tokens(result)
+    if token_budget <= 0 or est <= token_budget:
+        result["est_tokens"] = est
+        return
+
+    result["summary"]["budget_trimmed"] = True
+
+    def _under_budget() -> bool:
+        return estimate_tokens(result) <= token_budget
+
+    # Stage 1: Cap top-level cross-chat lists progressively
+    for cap in (30, 15, 8, 4, 2):
+        for key in ("links", "attachments", "mentions"):
+            if key in result and len(result[key]) > cap:
+                result[key] = result[key][:cap]
+        if cap <= 8 and "top_senders" in result and len(result["top_senders"]) > 5:
+            result["top_senders"] = result["top_senders"][:5]
+        if _under_budget():
+            result["est_tokens"] = estimate_tokens(result)
+            return
+
+    # Stage 2: Trim per-chat highlights count progressively
+    per_chat: list[dict[str, Any]] = result["per_chat"]
+    for hi_cap in (4, 2, 1, 0):
+        for entry in per_chat:
+            if "highlights" in entry:
+                if hi_cap == 0:
+                    entry.pop("highlights", None)
+                elif len(entry["highlights"]) > hi_cap:
+                    entry["highlights"] = entry["highlights"][:hi_cap]
+        if _under_budget():
+            result["est_tokens"] = estimate_tokens(result)
+            return
+
+    # Stage 3: Drop per-chat buckets & top_senders from lower-activity chats upward
+    for idx in range(len(per_chat) - 1, -1, -1):
+        entry = per_chat[idx]
+        changed = False
+        for k in ("buckets", "top_senders", "by_type"):
+            if k in entry:
+                entry.pop(k, None)
+                changed = True
+        if changed and _under_budget():
+            result["est_tokens"] = estimate_tokens(result)
+            return
+
+    # Stage 4: Drop lowest-activity per_chat entries (keeping >= 1 if non-empty)
+    while len(per_chat) > 1 and not _under_budget():
+        per_chat.pop()
+        result["summary"]["omitted_chats"] += 1
+
+    # Stage 5: Final fallback for ultra-small explicit budgets
+    for key in ("links", "attachments", "mentions", "top_senders"):
+        if _under_budget():
+            break
+        if key in result and result[key]:
+            result[key] = []
+
+    result["est_tokens"] = estimate_tokens(result)
+
+
 def build_digest(
     repo: Any,
     *,
@@ -57,11 +120,16 @@ def build_digest(
     include: list[str] | None = None,
     max_highlights_per_chat: int = 8,
     max_text_chars: int = 160,
+    max_chats: int = 20,
+    token_budget: int = 4000,
     include_self: bool = True,
 ) -> dict[str, Any]:
     """Aggregate messages across chats into a structured, token-budgeted digest."""
     if buckets not in ("hour", "day", "none"):
         raise ValueError(f"Unsupported buckets mode: {buckets}")
+
+    max_chats_clamped = max(1, min(int(max_chats), 200))
+    budget_clamped = max(0, int(token_budget))
 
     sections = (
         {s.strip().lower() for s in include if s and s.strip()}
@@ -93,23 +161,23 @@ def build_digest(
     total_noise = 0
     active_chats = 0
 
-    for chat in target_chats:
-        if (
-            not explicit_chats
-            and since_ts is not None
-            and (chat.last_timestamp <= 0 or chat.last_timestamp < since_ts - 60)
-        ):
-            continue
+    eligible_chats = [
+        chat
+        for chat in target_chats
+        if explicit_chats
+        or since_ts is None
+        or (chat.last_timestamp > 0 and chat.last_timestamp >= since_ts - 60)
+    ]
+    batch_by_chat = repo.get_messages_batch(
+        eligible_chats,
+        limit_per_chat=1000,
+        since_ts=since_ts,
+        until_ts=until_ts,
+        include_self=include_self,
+    )
 
-        res = repo.get_messages(
-            chat.chat_id,
-            chat_name=chat.display_name,
-            limit=1000,
-            since_ts=since_ts,
-            until_ts=until_ts,
-            include_self=include_self,
-        )
-        msgs: list[MessageEvent] = res["messages"]
+    for chat in eligible_chats:
+        msgs: list[MessageEvent] = batch_by_chat.get(chat.chat_id, [])
         if not msgs:
             continue
 
@@ -245,6 +313,9 @@ def build_digest(
         per_chat_out.append(chat_entry)
 
     per_chat_out.sort(key=lambda c: c["signal_count"], reverse=True)
+    attachments_out.sort(key=lambda a: (0 if a.get("available") else 1, -int(a.get("seq") or 0)))
+    kept_chats = per_chat_out[:max_chats_clamped]
+    omitted_chats = max(0, len(per_chat_out) - len(kept_chats))
 
     result: dict[str, Any] = {
         "ok": True,
@@ -254,6 +325,8 @@ def build_digest(
             "until_ts": until_ts,
             "scope": scope,
             "buckets": buckets,
+            "max_chats": max_chats_clamped,
+            "token_budget": budget_clamped,
         },
         "summary": {
             "active_chats": active_chats,
@@ -263,8 +336,10 @@ def build_digest(
             "links_count": len(links_out),
             "attachments_count": len(attachments_out),
             "mentions_count": len(mentions_out),
+            "omitted_chats": omitted_chats,
+            "budget_trimmed": False,
         },
-        "per_chat": per_chat_out,
+        "per_chat": kept_chats,
     }
     if "top_senders" in sections:
         result["top_senders"] = [
@@ -277,5 +352,5 @@ def build_digest(
     if "mentions" in sections:
         result["mentions"] = mentions_out[:100]
 
-    result["est_tokens"] = estimate_tokens(result)
+    _apply_digest_budget(result, budget_clamped)
     return result

@@ -10,7 +10,6 @@ import sys
 from typing import Any, Callable, Literal
 
 import anyio
-import uvicorn
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 
@@ -61,7 +60,7 @@ def create_mcp_server(
     """Create a read-only MCPServer exposing account discovery, history, digests, attachments, and live watching."""
     server = MCPServer(
         name=name,
-        version="0.2.0",
+        version="0.3.0",
         instructions=(
             "Read-only Windows WeChat 4.x local observer. "
             "Use list_accounts and select_account (or pass explicit account='...' per call without mutating global state). "
@@ -311,7 +310,8 @@ def create_mcp_server(
         name="digest",
         description=(
             "Build a compact server-side cross-chat digest over a time window (e.g. since='24h', '7d', '30m'). "
-            "Reduces multiple chats into per-chat counts, hourly/daily buckets, top_senders, links, attachments, @mentions, and highlights."
+            "Reduces multiple chats into per-chat counts, hourly/daily buckets, top_senders, links, attachments, @mentions, and highlights, "
+            "enforcing max_chats (default 20) and token_budget (default 4000; 0 disables) while keeping exact global counts."
         ),
         annotations=_READONLY_TOOL,
     )
@@ -324,6 +324,8 @@ def create_mcp_server(
         include: list[Literal["counts", "top_senders", "links", "attachments", "mentions", "highlights"]] | None = None,
         max_highlights_per_chat: int = 8,
         max_text_chars: int = 160,
+        max_chats: int = 20,
+        token_budget: int = 4000,
         include_self: bool = True,
         account: str | None = None,
     ) -> dict[str, Any]:
@@ -337,6 +339,8 @@ def create_mcp_server(
             include=include,
             max_highlights_per_chat=max_highlights_per_chat,
             max_text_chars=max_text_chars,
+            max_chats=max_chats,
+            token_budget=token_budget,
             include_self=include_self,
             account=account,
         )
@@ -429,7 +433,7 @@ def build_streamable_http_app(
     token: str | None = None,
     json_response: bool = True,
 ) -> Any:
-    """Build a Starlette ASGI app serving MCP Streamable HTTP at /mcp."""
+    """Build an ASGI app serving MCP Streamable HTTP at /mcp."""
     server = create_mcp_server(service)
     app = server.streamable_http_app(
         streamable_http_path="/mcp",
@@ -466,6 +470,8 @@ def run_mcp_server(
             server = create_mcp_server(service)
             server.run(transport="stdio")
         elif transport == "http":
+            import uvicorn
+
             app = build_streamable_http_app(service, host=host, token=token)
             config = uvicorn.Config(
                 app,

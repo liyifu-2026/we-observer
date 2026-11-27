@@ -1,4 +1,4 @@
-"""Unified ObserverService facade shared by CLI, Web UI, and MCP server."""
+"""Unified ObserverService facade shared by CLI and MCP server."""
 
 from __future__ import annotations
 
@@ -547,6 +547,8 @@ class ObserverService:
         include: list[str] | None = None,
         max_highlights_per_chat: int = 8,
         max_text_chars: int = 160,
+        max_chats: int = 20,
+        token_budget: int = 4000,
         include_self: bool = True,
         account: str | None = None,
         pid: int | None = None,
@@ -568,6 +570,8 @@ class ObserverService:
             include=include,
             max_highlights_per_chat=max(1, min(int(max_highlights_per_chat), 50)),
             max_text_chars=max(20, min(int(max_text_chars), 2000)),
+            max_chats=max(1, min(int(max_chats), 200)),
+            token_budget=max(0, int(token_budget)),
             include_self=include_self,
         )
 

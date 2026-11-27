@@ -95,6 +95,7 @@ def _print_digest_summary(payload: dict) -> None:
         f"Digest account={payload.get('account_id')} scope={win.get('scope')} "
         f"active_chats={summary.get('active_chats', 0)} total={summary.get('total_messages', 0)} "
         f"signal={summary.get('signal_messages', 0)} noise={summary.get('noise_messages', 0)} "
+        f"omitted_chats={summary.get('omitted_chats', 0)} trimmed={summary.get('budget_trimmed', False)} "
         f"est_tokens={payload.get('est_tokens', 0)}"
     )
     for chat in payload.get("per_chat") or []:
@@ -233,6 +234,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_digest.add_argument("--include", action="append", help="Sections (counts,top_senders,links,attachments,mentions,highlights)")
     p_digest.add_argument("--highlights", type=int, default=8, dest="highlights", help="Max highlight items per chat")
     p_digest.add_argument("--max-chars", type=int, default=160, dest="max_chars", help="Max highlight text length")
+    p_digest.add_argument("--max-chats", type=int, default=20, dest="max_chats", help="Max per-chat sections to include (1-200)")
+    p_digest.add_argument("--token-budget", type=int, default=4000, dest="token_budget", help="Target output est_tokens cap (0 disables)")
     p_digest.add_argument("--exclude-self", action="store_true", help="Exclude messages sent by this account")
     p_digest.add_argument("--account", default=None)
     p_digest.add_argument("--pid", type=int, default=None)
@@ -247,14 +250,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p_attach.add_argument("--limit", type=int, default=50)
     p_attach.add_argument("--account", default=None)
     p_attach.add_argument("--pid", type=int, default=None)
-
-    p_ui = sub.add_parser("ui", parents=[common_sub], help="Launch the minimal local read-only Web UI")
-    p_ui.add_argument("--host", default="127.0.0.1")
-    p_ui.add_argument("--port", type=int, default=8766)
-    p_ui.add_argument("--token", default=None, help="Optional access token for Web UI APIs")
-    p_ui.add_argument("--account", default=None)
-    p_ui.add_argument("--pid", type=int, default=None)
-    p_ui.add_argument("--no-open", action="store_true", help="Do not open browser automatically")
 
     return parser
 
@@ -377,6 +372,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 include=_split_csv_arg(args.include) or None,
                 max_highlights_per_chat=args.highlights,
                 max_text_chars=args.max_chars,
+                max_chats=args.max_chats,
+                token_budget=args.token_budget,
                 include_self=not args.exclude_self,
                 account=args.account,
                 pid=args.pid,
@@ -440,7 +437,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
 
         if cmd == "mcp":
-            from wx_observer.mcp_server import run_mcp_server
+            try:
+                from wx_observer.mcp_server import run_mcp_server
+            except ModuleNotFoundError as exc:
+                raise WxObserverError(
+                    "mcp_not_installed",
+                    'MCP dependencies are not installed. Install with: pip install -e ".[mcp]"',
+                ) from exc
 
             run_mcp_server(
                 service,
@@ -450,20 +453,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 token=args.token,
                 account=args.account,
                 pid=args.pid,
-            )
-            return 0
-
-        if cmd == "ui":
-            from wx_observer.web_ui import run_web_ui
-
-            run_web_ui(
-                service,
-                host=args.host,
-                port=args.port,
-                token=args.token,
-                account=args.account,
-                pid=args.pid,
-                open_browser=not args.no_open,
             )
             return 0
 

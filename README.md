@@ -1,6 +1,6 @@
 # wx-observer
 
-面向 Windows 10 / 11 微信 4.x（`Weixin.exe`）的**纯只读**本地聊天记录提取与实时消息观察工具，原生提供 CLI、MCP Server（`stdio` / Streamable HTTP）以及极简本地实时监控面板。
+面向 Windows 10 / 11 微信 4.x（`Weixin.exe`）的**纯只读**本地聊天记录提取与实时消息观察工具，原生提供 CLI 与 MCP Server（`stdio` / Streamable HTTP）。
 
 > [!CAUTION]
 > **免责与学习声明（仅供学习研究使用）**
@@ -15,10 +15,9 @@
 
 - **后台账号实时识别与无状态查询**：动态枚举本机运行中的 `Weixin.exe` 进程及其打开的 `db_storage` 句柄，自动定位自定义/迁移后的存储目录，区分在线与离线账号；各读取接口传入显式 `account` 参数时独立执行、不改写进程默认绑定状态，并按账号/游标分段加锁。
 - **紧凑型历史提取与关键词片段检索**：跨 `message_*.db` 分片合并查询，按分片独立 `Name2Id` 精确还原发送者，支持按 `chat_id` / 备注 / 昵称 / 群名模糊匹配，支持相对时间窗（如 `24h`、`7d`、`30m`）与 ISO/时间戳区间过滤。MCP 默认启用 `detail="compact"`、`max_text_chars=300`（`detail="full"` 不截断）与 `skip_noise=True`，检索自动返回围绕关键词的 `snippet`、`match_offset` 及 `est_tokens` 估算值；CLI 默认保持全字段输出（可用 `--compact` / `--skip-noise` 切换，支持导出 JSON / JSONL / CSV / Markdown）。
-- **服务端跨会话摘要与本地附件定位**：新增 `digest` 工具在服务端一次性聚合私聊/群聊消息统计、按小时/按天分布、`top_senders`、URL 外链、`@提及` 与高信号摘要；新增 `list_attachments` 解析群/私聊文件及转发聊天记录（`chat_history`）内嵌文件对应的本地明文路径，支持 Windows `(1)/(2)` 重名后缀与 MD5/文件大小置信度校验。
-- **至少一次（At-Least-Once）实时增量监控**：基于 SQLite `-wal` 增量帧合并与 `sort_seq` 组原子投递，各 `cursor_id` 独立持久化断点防重启漏消息；MCP 端 `poll_new_messages` / `wait_for_messages` 默认 `peek=True` 返回 `ack_token`，消费完成后调用 `ack_messages` 才推进持久化水位，防止 Agent 超时或压缩上下文时丢消息；CLI `watch` 与 Web UI SSE 保持连续自动提交。
+- **服务端跨会话摘要与本地附件定位**：新增 `digest` 工具在服务端通过单遍跨分片批量扫描聚合私聊/群聊统计、按小时/按天分布、`top_senders`、URL 外链、`@提及` 与高信号摘要，并默认内置 `max_chats=20` 与 `token_budget=4000` 硬预算控制；新增 `list_attachments` 解析群/私聊文件及转发聊天记录（`chat_history`）内嵌文件对应的本地明文路径，支持 Windows `(1)/(2)` 重名后缀与 MD5/文件大小置信度校验。
+- **至少一次（At-Least-Once）实时增量监控**：基于 SQLite `-wal` 增量帧合并与 `sort_seq` 组原子投递，各 `cursor_id` 独立持久化断点防重启漏消息；MCP 端 `poll_new_messages` / `wait_for_messages` 默认 `peek=True` 返回 `ack_token`，消费完成后调用 `ack_messages` 才推进持久化水位，防止 Agent 超时或压缩上下文时丢消息；CLI `watch` 保持连续自动提交。
 - **Agent 原生 MCP 接入**：内置标准 MCP Server，提供 12 个标注 `readOnlyHint=true` 的只读工具，同时支持 `stdio`（客户端拉起）与本机 `127.0.0.1` Streamable HTTP（可选 Bearer Token 鉴权）。
-- **极简本地 Web 控制台**：提供零外部 CDN、纯只读的单页控制台（`wx-observer ui`），支持切换在线账号、勾选要监控的私聊/群聊并实时滚动推送新消息。
 
 ---
 
@@ -27,7 +26,7 @@
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Client as Agent / CLI / Web UI
+    participant Client as Agent / CLI
     participant Svc as ObserverService
     participant Disc as Discovery & KeyStore
     participant Pool as SQLCipher4 + WAL Pool
@@ -70,7 +69,7 @@ sequenceDiagram
 请帮我在本地安装并配置开源项目 https://github.com/liyifu-2026/we-observer.git （纯只读微信 4.x 观察与 MCP 工具）：
 
 1. 确认环境为 Windows 64 位且已安装 Python 3.11+ 与 git；将仓库克隆到合适目录（例如 C:\Tools\wx-observer 或当前工作区旁边的 wx-observer）。
-2. 在仓库内创建独立虚拟环境 .venv，升级 pip/setuptools/wheel 后执行可编辑安装（`pip install -e ".[dev]"`）；若系统 Python 的 `ensurepip` 报错请用 `python -m venv --without-pip .venv` 并使用宿主 `python -m pip --python .\.venv\Scripts\python.exe` 引导安装，若直连 PyPI 较慢可加镜像参数 `-i https://pypi.tuna.tsinghua.edu.cn/simple`。
+2. 在仓库内创建独立虚拟环境 .venv，升级 pip/setuptools/wheel 后执行可编辑安装（需 MCP 功能装 `pip install -e ".[mcp,dev]"`，仅用 CLI 可装 `pip install -e .`）；若系统 Python 的 `ensurepip` 报错请用 `python -m venv --without-pip .venv` 并使用宿主 `python -m pip --python .\.venv\Scripts\python.exe` 引导安装，若直连 PyPI 较慢可加镜像参数 `-i https://pypi.tuna.tsinghua.edu.cn/simple`。
 3. 运行单元测试（pytest -v tests）确认所有离线测试通过。
 4. 运行 `<venv>\Scripts\wx-observer.exe accounts --json` 验证命令可正常执行（如当前本机未打开微信或未登录，只需如实告知我）。
 5. 为当前客户端配置好该 MCP Server（stdio 模式）：
@@ -90,6 +89,14 @@ git clone https://github.com/liyifu-2026/we-observer.git
 cd we-observer
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip setuptools wheel
+
+# 仅使用 CLI（仅 4 个核心依赖：cryptography / zstandard / psutil / pywin32）
+.\.venv\Scripts\pip.exe install -e .
+
+# 含 MCP Server（推荐，增加 mcp / pydantic / uvicorn）
+.\.venv\Scripts\pip.exe install -e ".[mcp]"
+
+# 开发与完整离线测试
 .\.venv\Scripts\pip.exe install -e ".[dev]"
 ```
 
@@ -131,22 +138,14 @@ python -m venv .venv
 # 紧凑模式读取历史（过滤表情/系统消息，查看 est_tokens）
 .\.venv\Scripts\wx-observer.exe history "产品研发群" --since 24h --compact --skip-noise --json
 
-# 生成最近 24 小时跨会话聚合摘要
-.\.venv\Scripts\wx-observer.exe digest --scope all --since 24h
+# 生成最近 24 小时跨会话聚合摘要（默认最多展示 20 个最活跃会话并受 4000 est_tokens 预算控制）
+.\.venv\Scripts\wx-observer.exe digest --scope all --since 24h --max-chats 20 --token-budget 4000
 
 # 列出最近 7 天聊天与转发记录中的附件及其本地明文路径
 .\.venv\Scripts\wx-observer.exe attachments --since 7d --only-available
 ```
 
-### 3. 启动极简实时监控 Web UI
-
-```powershell
-.\.venv\Scripts\wx-observer.exe ui
-```
-
-启动后仅监听 `http://127.0.0.1:8766/` 并自动打开浏览器，可用于在页面中切换后台账号、勾选需要盯防的私聊或群聊，并实时滚动查看新消息（支持 `--no-open` 与 `--token`）。
-
-### 4. 配置 MCP Server
+### 3. 配置 MCP Server
 
 #### 方式一：`stdio` 模式（推荐，由 Agent 客户端自动拉起）
 
@@ -178,7 +177,7 @@ python -m venv .venv
 | `list_chats` | 列出私聊/群聊，支持 `chat_type` 与昵称/备注/群名模糊过滤，附带 `est_tokens` |
 | `get_messages` | 提取指定会话历史，支持 `before_seq`/`after_seq` 翻页、相对/ISO 时间窗（`24h`/`7d`）、类型与发送者筛选；默认 `detail="compact"`（300 字符上限）与 `skip_noise=True`，可切 `detail="full"` |
 | `search_messages` | 按关键词检索指定会话或全库消息（含压缩长文），默认 `compact` 仅返回围绕匹配词的 `snippet` 与 `match_offset` |
-| `digest` | 服务端跨会话聚合摘要，按范围与时间窗输出计数、小时/天活跃桶、`top_senders`、URL 外链、附件、提及与精选高亮 |
+| `digest` | 服务端跨会话聚合摘要，单遍扫描输出计数、活跃桶、`top_senders`、外链、附件、提及与精选高亮，并支持 `max_chats`/`token_budget` 硬预算控制 |
 | `list_attachments` | 列出聊天文件与转发记录内嵌文件，并按路径安全边界、同名 `(1)` 后缀、文件大小与 MD5 解析本地明文路径 |
 | `configure_watch` | 为独立 `cursor_id` 配置监控范围（`all`/`private`/`group`/`allowlist`、排除列表、是否含自己） |
 | `poll_new_messages` | 非阻塞拉取 `cursor_id` 增量新消息；默认 `peek=True` 返回 `ack_token` 而不推进水位，`detail="compact"`、`skip_noise=True` |
@@ -195,4 +194,4 @@ python -m venv .venv
 
 - **密钥保护**：提取的 SQLCipher 密钥仅通过 Windows DPAPI（`CryptProtectData`）按当前 Windows 用户加密保存在 `%LOCALAPPDATA%\wx-observer\keys\`；若缓存损坏或跨用户复制，直接失败拒绝，绝不回落为明文解析。也支持通过 `--keys-file` 注入外部密钥文件。
 - **临时文件自动销毁**：解密后的 SQLite 快照仅存放在 `%TEMP%\wx_observer_tmp\sess-<pid>-<uuid>\` 独立会话目录中，正常退出或收到中断信号时自动清理，启动时亦会回收已退出进程的残留目录。
-- **本地监听限制**：MCP Streamable HTTP 与 Web UI 默认均绑定 `127.0.0.1`，并支持通过 `--token` 开启恒定时间比对（`hmac.compare_digest`）访问校验。
+- **本地监听限制**：MCP Streamable HTTP 默认绑定 `127.0.0.1`，并支持通过 `--token` 开启恒定时间比对（`hmac.compare_digest`）访问校验。

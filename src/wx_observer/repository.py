@@ -702,29 +702,26 @@ class AccountRepository:
                 return False
         return True
 
-    def get_messages(
-        self,
-        chat_id: str,
+    _MSG_COLS = (
+        "local_id",
+        "local_type",
+        "real_sender_id",
+        "create_time",
+        "message_content",
+        "compress_content",
+        "server_id",
+        "sort_seq",
+    )
+
+    @staticmethod
+    def _build_message_where(
         *,
-        chat_name: str | None = None,
-        limit: int = 50,
         before_seq: int | None = None,
         after_seq: int | None = None,
         since_ts: int | None = None,
         until_ts: int | None = None,
         msg_types: list[str] | None = None,
-        sender: str | None = None,
-        keyword: str | None = None,
-        include_self: bool = True,
-    ) -> dict[str, Any]:
-        """Fetch historical messages for a single chat in chronological ascending order."""
-        limit = max(1, min(int(limit), 1000))
-        ctype: ChatType = "group" if chat_id.endswith("@chatroom") else "private"
-        resolved_name = chat_name or self.get_display_name(chat_id)
-        contacts = self._load_contacts()
-        own_wxid = self.get_own_wxid()
-        own_display = self.get_own_display_name()
-
+    ) -> tuple[str, list[Any]]:
         clauses: list[str] = []
         params: list[Any] = []
         if before_seq is not None:
@@ -767,6 +764,87 @@ class AccountRepository:
                 params.extend(sub_codes)
 
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        return where_sql, params
+
+    def _query_chat_table_events(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        rel: str,
+        shard_name: str,
+        table: str,
+        chat_id: str,
+        chat_type: ChatType,
+        chat_name: str,
+        where_sql: str,
+        params: list[Any],
+        order_sql: str,
+        limit_sql: str,
+        name_map: dict[int, str],
+        own_wxid: str,
+        own_display: str,
+        contacts: dict[str, dict[str, str]],
+        msg_types: list[str] | None = None,
+        sender: str | None = None,
+        keyword: str | None = None,
+        include_self: bool = True,
+    ) -> list[MessageEvent]:
+        cols = self._table_columns(conn, rel, table)
+        wanted_cols = [c for c in self._MSG_COLS if c in cols]
+        sql = f'SELECT {", ".join(wanted_cols)} FROM "{table}" {where_sql} {order_sql}{limit_sql}'
+        out: list[MessageEvent] = []
+        for r in conn.execute(sql, tuple(params)):
+            ev = self._row_to_event(
+                r,
+                shard=shard_name,
+                chat_id=chat_id,
+                chat_type=chat_type,
+                chat_name=chat_name,
+                name_map=name_map,
+                own_wxid=own_wxid,
+                own_display=own_display,
+                contacts=contacts,
+            )
+            if self._matches_event_filters(
+                ev,
+                msg_types=msg_types,
+                sender=sender,
+                keyword=keyword,
+                include_self=include_self,
+            ):
+                out.append(ev)
+        return out
+
+    def get_messages(
+        self,
+        chat_id: str,
+        *,
+        chat_name: str | None = None,
+        limit: int = 50,
+        before_seq: int | None = None,
+        after_seq: int | None = None,
+        since_ts: int | None = None,
+        until_ts: int | None = None,
+        msg_types: list[str] | None = None,
+        sender: str | None = None,
+        keyword: str | None = None,
+        include_self: bool = True,
+    ) -> dict[str, Any]:
+        """Fetch historical messages for a single chat in chronological ascending order."""
+        limit = max(1, min(int(limit), 1000))
+        ctype: ChatType = "group" if chat_id.endswith("@chatroom") else "private"
+        resolved_name = chat_name or self.get_display_name(chat_id)
+        contacts = self._load_contacts()
+        own_wxid = self.get_own_wxid()
+        own_display = self.get_own_display_name()
+
+        where_sql, params = self._build_message_where(
+            before_seq=before_seq,
+            after_seq=after_seq,
+            since_ts=since_ts,
+            until_ts=until_ts,
+            msg_types=msg_types,
+        )
         has_post_filter = bool(msg_types or sender or keyword or not include_self)
         ascending_fetch = after_seq is not None and before_seq is None
 
@@ -798,42 +876,29 @@ class AccountRepository:
                 for conn, rel, table in shards:
                     shard_name = os.path.basename(rel)
                     name_map = self._load_shard_name2id(conn, rel)
-                    cols = self._table_columns(conn, rel, table)
-                    wanted_cols = [
-                        c
-                        for c in (
-                            "local_id",
-                            "local_type",
-                            "real_sender_id",
-                            "create_time",
-                            "message_content",
-                            "compress_content",
-                            "server_id",
-                            "sort_seq",
-                        )
-                        if c in cols
-                    ]
-                    sql = f'SELECT {", ".join(wanted_cols)} FROM "{table}" {where_sql} {order_sql}{limit_sql}'
-                    for r in conn.execute(sql, tuple(params)):
-                        ev = self._row_to_event(
-                            r,
-                            shard=shard_name,
+                    raw_collected.extend(
+                        self._query_chat_table_events(
+                            conn,
+                            rel=rel,
+                            shard_name=shard_name,
+                            table=table,
                             chat_id=chat_id,
                             chat_type=ctype,
                             chat_name=resolved_name,
+                            where_sql=where_sql,
+                            params=params,
+                            order_sql=order_sql,
+                            limit_sql=limit_sql,
                             name_map=name_map,
                             own_wxid=own_wxid,
                             own_display=own_display,
                             contacts=contacts,
-                        )
-                        if self._matches_event_filters(
-                            ev,
                             msg_types=msg_types,
                             sender=sender,
                             keyword=keyword,
                             include_self=include_self,
-                        ):
-                            raw_collected.append(ev)
+                        )
+                    )
 
                 if ascending_fetch:
                     raw_collected.sort(key=lambda e: (e.sort_seq, e.shard, e.local_id))
@@ -865,6 +930,98 @@ class AccountRepository:
             "next_before_seq": next_before,
             "latest_sort_seq": latest_seq,
         }
+
+    def get_messages_batch(
+        self,
+        chats: list[ChatInfo],
+        *,
+        limit_per_chat: int = 500,
+        since_ts: int | None = None,
+        until_ts: int | None = None,
+        msg_types: list[str] | None = None,
+        include_self: bool = True,
+    ) -> dict[str, list[MessageEvent]]:
+        """Fetch latest messages across multiple chats by opening each matching shard at most once."""
+        if not chats:
+            return {}
+        limit_per_chat = max(1, min(int(limit_per_chat), 1000))
+        unique_chats: dict[str, ChatInfo] = {}
+        for c in chats:
+            if c.chat_id not in unique_chats:
+                unique_chats[c.chat_id] = c
+        table_to_chat = {"Msg_" + _md5_hex(cid): c for cid, c in unique_chats.items()}
+        results: dict[str, list[MessageEvent]] = {cid: [] for cid in unique_chats}
+
+        shard_rels = [rel for rel in self._message_shard_rels() if self.pool.has_key(rel)]
+        if not shard_rels:
+            return results
+
+        contacts = self._load_contacts()
+        own_wxid = self.get_own_wxid()
+        own_display = self.get_own_display_name()
+        where_sql, params = self._build_message_where(
+            since_ts=since_ts,
+            until_ts=until_ts,
+            msg_types=msg_types,
+        )
+        has_post_filter = bool(msg_types or not include_self)
+        per_shard_cap = None if has_post_filter else (limit_per_chat + 1)
+        limit_sql = f" LIMIT {per_shard_cap}" if per_shard_cap is not None else ""
+        order_sql = "ORDER BY sort_seq DESC, local_id ASC"
+
+        for attempt in (0, 1):
+            force_rebuild = attempt == 1
+            per_chat_raw: dict[str, list[MessageEvent]] = {cid: [] for cid in unique_chats}
+            try:
+                for rel in shard_rels:
+                    shard_tables = self._get_shard_tables(rel, force_rebuild=force_rebuild)
+                    matching_tables = [tbl for tbl in table_to_chat if tbl in shard_tables]
+                    if not matching_tables:
+                        continue
+                    conn = self.pool.open_readonly(rel, force_rebuild=force_rebuild)
+                    try:
+                        name_map = self._load_shard_name2id(conn, rel)
+                        shard_name = os.path.basename(rel)
+                        for tbl in matching_tables:
+                            chat = table_to_chat[tbl]
+                            per_chat_raw[chat.chat_id].extend(
+                                self._query_chat_table_events(
+                                    conn,
+                                    rel=rel,
+                                    shard_name=shard_name,
+                                    table=tbl,
+                                    chat_id=chat.chat_id,
+                                    chat_type=chat.chat_type,
+                                    chat_name=chat.display_name,
+                                    where_sql=where_sql,
+                                    params=params,
+                                    order_sql=order_sql,
+                                    limit_sql=limit_sql,
+                                    name_map=name_map,
+                                    own_wxid=own_wxid,
+                                    own_display=own_display,
+                                    contacts=contacts,
+                                    msg_types=msg_types,
+                                    include_self=include_self,
+                                )
+                            )
+                    finally:
+                        conn.close()
+
+                for cid, raw_collected in per_chat_raw.items():
+                    if not raw_collected:
+                        continue
+                    raw_collected.sort(key=lambda e: (-e.sort_seq, e.shard, e.local_id))
+                    chosen = list(reversed(raw_collected[:limit_per_chat]))
+                    chosen.sort(key=lambda e: (e.sort_seq, e.shard, e.local_id))
+                    results[cid] = chosen
+                return results
+            except sqlite3.DatabaseError as exc:
+                if attempt == 0 and _is_malformed_error(exc):
+                    self._invalidate_all()
+                    continue
+                raise
+        return results
 
     def search_messages(
         self,
