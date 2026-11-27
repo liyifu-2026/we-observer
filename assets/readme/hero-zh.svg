@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="300" viewBox="0 0 1200 300" role="img" aria-labelledby="hero-title hero-desc">
+  <title id="hero-title">wx-observer — Windows 微信 4.x 本地只读聊天记录提取与观察工具</title>
+  <desc id="hero-desc">左侧显示工具定位、一句话说明以及 CLI、MCP、Skills 规模指标；右侧展示 db_storage、DPAPI 密钥缓存与零自动化安全边界。</desc>
+
+  <defs>
+    <clipPath id="hero-card-clip">
+      <rect x="686" y="42" width="458" height="216" rx="12"/>
+    </clipPath>
+  </defs>
+
+  <rect x="0.75" y="0.75" width="1198.5" height="298.5" rx="20" fill="#0B1014" stroke="#243240" stroke-width="1.5"/>
+
+  <g id="hero-left">
+    <rect x="56" y="42" width="452" height="32" rx="16" fill="#111820" stroke="#243240" stroke-width="1.2"/>
+    <circle cx="76" cy="58" r="5" fill="#2CC97E"/>
+    <text x="92" y="64" fill="#8B9EB0" font-family="'Cascadia Mono','Consolas','SFMono-Regular',ui-monospace,monospace" font-size="18" letter-spacing="0.3">WINDOWS WECHAT 4.X · LOCAL READ-ONLY</text>
+
+    <text x="56" y="138" fill="#EDF2F7" font-family="'Segoe UI','Microsoft YaHei UI','PingFang SC',-apple-system,BlinkMacSystemFont,sans-serif" font-size="64" font-weight="700" letter-spacing="-1">wx-observer</text>
+
+    <text x="56" y="185" fill="#EDF2F7" font-family="'Segoe UI','Microsoft YaHei UI','PingFang SC',-apple-system,BlinkMacSystemFont,sans-serif" font-size="24" font-weight="500">只读提取本地微信聊天记录、附件与摘要</text>
+    <text x="56" y="218" fill="#8B9EB0" font-family="'Segoe UI','Microsoft YaHei UI','PingFang SC',-apple-system,BlinkMacSystemFont,sans-serif" font-size="20">支持终端 CLI 检索导出，以及面向 AI Agent 的 MCP 与 Skills</text>
+
+    <text x="56" y="258" fill="#8B9EB0" font-family="'Cascadia Mono','Consolas','Segoe UI','Microsoft YaHei UI',monospace,sans-serif" font-size="18">
+      <tspan fill="#2CC97E" font-weight="700">PS&gt;</tspan><tspan dx="10">CLI 8 子命令</tspan><tspan dx="14" fill="#243240">|</tspan><tspan dx="14">MCP 12 只读工具</tspan><tspan dx="14" fill="#243240">|</tspan><tspan dx="14">4 个场景 Skills</tspan>
+    </text>
+  </g>
+
+  <g id="hero-boundary-card">
+    <rect x="686" y="42" width="458" height="216" rx="12" fill="#111820"/>
+    <g clip-path="url(#hero-card-clip)">
+      <rect x="686" y="42" width="458" height="40" fill="#17212B"/>
+      <line x1="686" y1="82" x2="1144" y2="82" stroke="#243240" stroke-width="1"/>
+      <circle cx="708" cy="62" r="5" fill="#2CC97E"/>
+      <text x="723" y="68" fill="#8B9EB0" font-family="'Cascadia Mono','Consolas',ui-monospace,monospace" font-size="18">wx-observer · boundary</text>
+      <text x="1124" y="68" text-anchor="end" fill="#2CC97E" font-family="'Cascadia Mono','Consolas',ui-monospace,monospace" font-size="16" font-weight="700">STRICT RO</text>
+    </g>
+    <rect x="686" y="42" width="458" height="216" rx="12" fill="none" stroke="#243240" stroke-width="1.5"/>
+
+    <g font-family="'Cascadia Mono','Consolas','Microsoft YaHei UI','Segoe UI',monospace,sans-serif" font-size="18">
+      <text x="708" y="121" fill="#60A5FA">db_storage</text>
+      <text x="832" y="121" fill="#EDF2F7">SQLCipher4 + WAL</text>
+      <rect x="1056" y="101" width="68" height="26" rx="6" fill="#132A22" stroke="#2CC97E" stroke-width="1"/>
+      <text x="1090" y="120" text-anchor="middle" fill="#2CC97E" font-size="16" font-weight="700">RO</text>
+
+      <line x1="708" y1="142" x2="1124" y2="142" stroke="#1E2B37" stroke-width="1"/>
+
+      <text x="708" y="179" fill="#60A5FA">key_cache</text>
+      <text x="832" y="179" fill="#EDF2F7">Windows DPAPI</text>
+      <rect x="1056" y="159" width="68" height="26" rx="6" fill="#132238" stroke="#60A5FA" stroke-width="1"/>
+      <text x="1090" y="178" text-anchor="middle" fill="#60A5FA" font-size="16" font-weight="700">LOCAL</text>
+
+      <line x1="708" y1="200" x2="1124" y2="200" stroke="#1E2B37" stroke-width="1"/>
+
+      <text x="708" y="237" fill="#60A5FA">Weixin.exe</text>
+      <text x="832" y="237" fill="#EDF2F7">零自动化 · 不发消息</text>
+      <rect x="1056" y="217" width="68" height="26" rx="6" fill="#2C2415" stroke="#F2C46D" stroke-width="1"/>
+      <text x="1090" y="236" text-anchor="middle" fill="#F2C46D" font-size="16" font-weight="700">SAFE</text>
+    </g>
+  </g>
+</svg>
