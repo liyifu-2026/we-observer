@@ -378,34 +378,170 @@ def _parse_appmsg(
     )
 
 
-def _extract_recorditem_files(appmsg: ElementTree.Element) -> list[dict[str, Any]]:
-    rec_el = appmsg.find("recorditem")
-    if rec_el is None:
-        return []
-    rec_raw = (rec_el.text or "").strip()
-    if not rec_raw and len(rec_el) > 0:
-        rec_raw = ElementTree.tostring(rec_el[0], encoding="unicode").strip()
-    rec_root = _safe_parse_xml(rec_raw)
-    if rec_root is None:
-        return []
+def _parse_recordinfo_element(el: ElementTree.Element | None) -> ElementTree.Element | None:
+    if el is None:
+        return None
+    if el.tag == "recordinfo":
+        return el
+    child_info = el.find("recordinfo")
+    if child_info is not None:
+        return child_info
+    raw = (el.text or "").strip()
+    if not raw and len(el) > 0:
+        raw = ElementTree.tostring(el[0], encoding="unicode").strip()
+    parsed = _safe_parse_xml(raw)
+    if parsed is None:
+        return None
+    if parsed.tag == "recordinfo":
+        return parsed
+    return parsed.find("recordinfo") or parsed
+
+
+def _parse_recordinfo_items(
+    rec_root: ElementTree.Element,
+    *,
+    depth: int,
+    max_depth: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    datalist = rec_root.find("datalist")
+    if datalist is not None:
+        data_items = datalist.findall("dataitem")
+    else:
+        data_items = rec_root.findall("dataitem") or rec_root.findall(".//dataitem")
+
+    items: list[dict[str, Any]] = []
     files: list[dict[str, Any]] = []
-    for item in rec_root.findall(".//dataitem"):
-        if (item.attrib.get("datatype") or "").strip() != "8":
-            continue
-        fname = _clean_single_line(item.findtext("datatitle") or "", 240)
-        if not fname:
-            continue
-        entry: dict[str, Any] = {"filename": fname}
-        size_raw = (item.findtext("datasize") or "").strip()
-        if size_raw.isdigit():
-            entry["size_bytes"] = int(size_raw)
-        md5_raw = (item.findtext("fullmd5") or "").strip()
-        if _MD5_HEX_RE.match(md5_raw):
-            entry["md5"] = md5_raw.lower()
-        fmt = (item.findtext("datafmt") or "").strip()[:32]
-        if fmt:
-            entry["file_ext"] = fmt
-        files.append(entry)
+
+    for item in data_items:
+        dtype = (item.attrib.get("datatype") or "").strip()
+        data_id = (item.attrib.get("dataid") or "").strip()[:64]
+        sender = _clean_single_line(item.findtext("sourcename") or "", 80)
+        source_time = _clean_single_line(item.findtext("sourcetime") or "", 40)
+        title = _clean_single_line(item.findtext("datatitle") or "", 240)
+        desc = _clean_single_line(item.findtext("datadesc") or "", MAX_TEXT_CHARS)
+
+        entry: dict[str, Any] = {
+            "datatype": dtype,
+            "sender": sender,
+            "source_time": source_time,
+        }
+        if data_id:
+            entry["data_id"] = data_id
+
+        if dtype == "1":
+            entry["msg_type"] = "text"
+            entry["text"] = desc or title
+        elif dtype == "2":
+            entry["msg_type"] = "image"
+            entry["text"] = "[图片]"
+            meta: dict[str, Any] = {}
+            md5_raw = (item.findtext("fullmd5") or item.findtext("md5") or "").strip()
+            if _MD5_HEX_RE.match(md5_raw):
+                meta["md5"] = md5_raw.lower()
+            size_raw = (item.findtext("datasize") or "").strip()
+            if size_raw.isdigit():
+                meta["size_bytes"] = int(size_raw)
+            if meta:
+                entry["meta"] = meta
+        elif dtype == "3":
+            entry["msg_type"] = "voice"
+            entry["text"] = "[语音]"
+        elif dtype == "4":
+            entry["msg_type"] = "video"
+            entry["text"] = "[视频]"
+            size_raw = (item.findtext("datasize") or "").strip()
+            if size_raw.isdigit():
+                entry["meta"] = {"size_bytes": int(size_raw)}
+        elif dtype == "5":
+            entry["msg_type"] = "link"
+            entry["text"] = f"[链接: {title}]" if title else "[链接]"
+            meta = {}
+            if title:
+                meta["title"] = title
+            if desc:
+                meta["description"] = desc
+            link_url = (item.findtext("link") or item.findtext("url") or "").strip()[:1024]
+            if link_url:
+                meta["url"] = link_url
+            if meta:
+                entry["meta"] = meta
+        elif dtype == "6":
+            entry["msg_type"] = "location"
+            entry["text"] = f"[位置: {title}]" if title else "[位置]"
+        elif dtype == "8":
+            entry["msg_type"] = "file"
+            entry["text"] = f"[文件: {title}]" if title else "[文件]"
+            if title:
+                fmeta: dict[str, Any] = {"filename": title}
+                size_raw = (item.findtext("datasize") or "").strip()
+                if size_raw.isdigit():
+                    fmeta["size_bytes"] = int(size_raw)
+                md5_raw = (item.findtext("fullmd5") or item.findtext("md5") or "").strip()
+                if _MD5_HEX_RE.match(md5_raw):
+                    fmeta["md5"] = md5_raw.lower()
+                fmt = (item.findtext("datafmt") or "").strip()[:32]
+                if not fmt and "." in title:
+                    fmt = title.rsplit(".", 1)[-1].lower()[:32]
+                if fmt:
+                    fmeta["file_ext"] = fmt
+                entry["meta"] = dict(fmeta)
+                files.append(fmeta)
+        elif dtype == "17":
+            entry["msg_type"] = "chat_history"
+            entry["text"] = f"[聊天记录: {title}]" if title else "[聊天记录]"
+            if depth < max_depth:
+                nested_rec = _parse_recordinfo_element(item.find("recordxml"))
+                if nested_rec is None:
+                    nested_rec = _parse_recordinfo_element(item.find("recorditem"))
+                if nested_rec is not None:
+                    sub_items, sub_files = _parse_recordinfo_items(
+                        nested_rec, depth=depth + 1, max_depth=max_depth
+                    )
+                    if sub_items:
+                        entry["items"] = sub_items
+                    if sub_files:
+                        files.extend(sub_files)
+        else:
+            entry["msg_type"] = "other"
+            entry["text"] = title or desc or (f"[转发项 datatype={dtype}]" if dtype else "[转发项]")
+
+        items.append(entry)
+
+    return items, files
+
+
+def parse_recorditem_entries(
+    appmsg: ElementTree.Element,
+    *,
+    max_depth: int = 3,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Parse forwarded <recorditem> entries and collect all embedded file metadata."""
+    rec_root = _parse_recordinfo_element(appmsg.find("recorditem"))
+    if rec_root is None:
+        return [], []
+    return _parse_recordinfo_items(rec_root, depth=0, max_depth=max_depth)
+
+
+def parse_chat_history_xml(body: str, *, sender_id: str | None = None) -> dict[str, Any]:
+    """Parse raw forwarded chat_history (appmsg type 19) XML into structured items and files."""
+    stripped = strip_group_sender_prefix(body, sender_id)
+    root = _safe_parse_xml(stripped)
+    if root is None:
+        return {"title": "", "items": [], "embedded_files": []}
+    appmsg = root if root.tag == "appmsg" else root.find("appmsg")
+    if appmsg is None:
+        return {"title": "", "items": [], "embedded_files": []}
+    title = _clean_single_line(appmsg.findtext("title") or "", 240)
+    items, embedded_files = parse_recorditem_entries(appmsg)
+    return {
+        "title": title,
+        "items": items,
+        "embedded_files": embedded_files,
+    }
+
+
+def _extract_recorditem_files(appmsg: ElementTree.Element) -> list[dict[str, Any]]:
+    _items, files = parse_recorditem_entries(appmsg)
     return files
 
 

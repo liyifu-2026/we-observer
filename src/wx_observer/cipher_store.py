@@ -163,6 +163,21 @@ class SnapshotState:
 _SESS_DIR_RE = re.compile(r"^sess-(\d+)-[0-9a-f]+$")
 
 
+def count_residual_sessions(temp_root: str | Path | None = None) -> int:
+    """Count leftover session snapshot directories under temp_root."""
+    root = Path(temp_root) if temp_root else (Path(tempfile.gettempdir()) / "wx_observer_tmp")
+    if not root.is_dir():
+        return 0
+    count = 0
+    try:
+        for entry in root.iterdir():
+            if entry.is_dir() and _SESS_DIR_RE.match(entry.name):
+                count += 1
+    except OSError:
+        return count
+    return count
+
+
 def _cleanup_pool_ref(pool_ref: weakref.ReferenceType[EncryptedDatabasePool]) -> None:
     pool = pool_ref()
     if pool is not None:
@@ -203,6 +218,10 @@ class EncryptedDatabasePool:
 
     def has_key(self, rel_path: str) -> bool:
         return rel_path in self._keys
+
+    def get_snapshot_state(self, rel_path: str) -> SnapshotState | None:
+        with self._lock_for(rel_path):
+            return self._snapshots.get(rel_path)
 
     def _purge_dead_sessions(self) -> None:
         if not self._temp_root.is_dir():

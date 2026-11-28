@@ -11,7 +11,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
 
-from wx_observer.shaping import estimate_tokens, format_compact_time
+from wx_observer.shaping import estimate_tokens, format_compact_time, format_local_iso
+
+ATTACHMENT_NOT_DOWNLOADED_ACTION = (
+    "Attachment is not downloaded locally; open or download it in WeChat desktop first."
+)
 
 _INVALID_WIN_CHARS_RE = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 _YYYY_MM_RE = re.compile(r"^\d{4}-\d{2}$")
@@ -365,15 +369,59 @@ def resolve_local_file(
     }
 
 
+def enrich_embedded_files(
+    account_data_dir: str | Path,
+    embedded_files: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    timestamp: int = 0,
+    *,
+    file_index: LocalFileIndex | None = None,
+    verify_md5: bool = True,
+) -> list[dict[str, Any]]:
+    """Resolve local paths and availability flags for forwarded chat_history embedded files."""
+    if file_index is None:
+        file_index = build_file_index(account_data_dir)
+    out: list[dict[str, Any]] = []
+    for raw_item in embedded_files:
+        item = dict(raw_item)
+        fname = str(item.get("filename") or "").strip()
+        if not fname:
+            continue
+        ext = str(item.get("file_ext") or Path(fname).suffix.lstrip(".")).lower().lstrip(".")
+        resolved = resolve_local_file(
+            account_data_dir,
+            fname,
+            timestamp,
+            expected_size=item.get("size_bytes"),
+            expected_md5=item.get("md5"),
+            file_ext=ext,
+            file_index=file_index,
+            verify_md5=verify_md5,
+        )
+        item["available"] = resolved["available"]
+        item["local_path"] = resolved["local_path"]
+        if resolved.get("match_confidence"):
+            item["match_confidence"] = resolved["match_confidence"]
+        if item.get("size_bytes") is None and resolved.get("actual_size_bytes") is not None:
+            item["size_bytes"] = resolved["actual_size_bytes"]
+        if not resolved["available"]:
+            item["next_action"] = ATTACHMENT_NOT_DOWNLOADED_ACTION
+        else:
+            item.pop("next_action", None)
+        out.append(item)
+    return out
+
+
 def collect_attachments(
     repo: Any,
     *,
     scope: str = "all",
     chats: list[str] | None = None,
+    exclude_chats: list[str] | None = None,
     since_ts: int | None = None,
     until_ts: int | None = None,
     extensions: list[str] | None = None,
     only_available: bool = False,
+    include_embedded: bool = True,
     limit: int = 50,
 ) -> dict[str, Any]:
     """Scan file attachments across chats and resolve readable local paths."""
@@ -384,6 +432,11 @@ def collect_attachments(
         if ext and ext.strip()
     }
 
+    excluded_ids = {
+        repo.resolve_chat(ref).chat_id
+        for ref in (exclude_chats or [])
+        if ref and ref.strip()
+    }
     explicit_chats = bool(chats)
     if chats:
         target_chats = [repo.resolve_chat(ref) for ref in chats]
@@ -395,6 +448,8 @@ def collect_attachments(
             include_hidden=True,
             include_non_session=(since_ts is None),
         )
+    if excluded_ids:
+        target_chats = [c for c in target_chats if c.chat_id not in excluded_ids]
 
     file_index = build_file_index(repo.account.data_dir)
     eligible_chats = [
@@ -411,6 +466,7 @@ def collect_attachments(
     else:
         wave_size = max(1, len(eligible_chats))
 
+    query_msg_types = ["file", "chat_history"] if include_embedded else ["file"]
     found: list[dict[str, Any]] = []
     offset = 0
     while offset < len(eligible_chats):
@@ -421,7 +477,7 @@ def collect_attachments(
             limit_per_chat=500,
             since_ts=since_ts,
             until_ts=until_ts,
-            msg_types=["file", "chat_history"],
+            msg_types=query_msg_types,
             include_self=True,
         )
         for chat in chunk:
@@ -439,7 +495,7 @@ def collect_attachments(
                                 "source_type": "file",
                             }
                         )
-                elif ev.msg_type == "chat_history":
+                elif include_embedded and ev.msg_type == "chat_history":
                     for emb in ev.metadata.get("embedded_files") or ():
                         fname = str(emb.get("filename") or "").strip()
                         if fname:
@@ -490,6 +546,7 @@ def collect_attachments(
                             "local_path": local_path,
                             "match_confidence": confidence,
                             "t": format_compact_time(ev.timestamp, ev.iso_time),
+                            "ts_iso": format_local_iso(ev.timestamp, ev.iso_time),
                             "timestamp": ev.timestamp,
                             "chat": chat.display_name,
                             "chat_id": chat.chat_id,
@@ -507,6 +564,7 @@ def collect_attachments(
     trimmed = found[:limit]
     for entry in trimmed:
         if only_available and not entry.get("md5"):
+            entry.pop("next_action", None)
             continue
         resolved = resolve_local_file(
             repo.account.data_dir,
@@ -523,6 +581,10 @@ def collect_attachments(
         entry["match_confidence"] = resolved.get("match_confidence")
         if entry["size_bytes"] is None:
             entry["size_bytes"] = resolved.get("actual_size_bytes")
+        if not entry["available"]:
+            entry["next_action"] = ATTACHMENT_NOT_DOWNLOADED_ACTION
+        else:
+            entry.pop("next_action", None)
     if only_available:
         trimmed = [item for item in trimmed if item["available"]]
     available_count = sum(1 for item in trimmed if item["available"])

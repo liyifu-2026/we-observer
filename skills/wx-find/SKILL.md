@@ -10,9 +10,9 @@ description: 在微信历史记录中统一查找特定消息、某人说过的�
 ## 执行流程
 
 1. **按线索类型选择首跳工具（不确定时两条并行）**
-   - **偏文件/文档/作业/压缩包线索**：先调 `list_attachments(scope=..., chats=..., since=..., extensions=..., only_available=False, limit=30)`（含转发记录 `chat_history` 内嵌文件）。
-   - **偏文字/链接/某人发言线索**：先调 `search_messages(keyword=..., chat=..., chat_type=..., since=..., limit=20)`，利用返回的 `snippet`、`match_offset`、`chat_id` 与 `seq` 精准锚定位置（默认 `detail="compact"` 省 token）。
-   - 若仅记得大致对象不记得关键词，先 `list_chats(query=...)` 锁定会话，再用 `get_messages(chat=..., sender=..., msg_types=..., since=..., limit=30)` 筛选。
+   - **偏文件/文档/作业/压缩包线索**：先调 `list_attachments(chat_type=..., chats=..., exclude_chats=..., since=..., extensions=..., only_available=False, limit=30)`（含转发记录 `chat_history` 内嵌文件）。若发现关键资料在某条转发聊天记录（`type="chat_history"`）内，调 `expand_chat_history(chat=chat_id, seq=...)` 展开子消息与全部内嵌文件的本地路径。
+   - **偏文字/链接/某人发言线索**：先调 `search_messages(keyword=..., chat=..., chats=..., exclude_chats=..., chat_type=..., since=..., min_activity=..., limit=20)`，利用返回的 `snippet`、`match_offset`、`chat_id` 与 `seq` 精准锚定位置（默认 `detail="compact"` 省 token）。
+   - 若仅记得大致对象不记得关键词，先 `list_chats(name_query=...)` 锁定会话，再用 `get_messages(chat=..., sender=..., msg_types=..., since=..., limit=30)` 筛选。
 2. **还原锚点前后的完整语境**
    - 拿到命中记录的 `chat_id` 与 `seq` 后，用 `get_messages(chat=chat_id, before_seq=seq + 5, limit=12, detail="compact")` 或联合 `after_seq` 拉取命中前后的真实对话，避免断章取义。
    - 遇到被截断的长文本需要全文核对时，仅针对该小窗口传 `detail="full"`。

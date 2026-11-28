@@ -62,6 +62,7 @@ class RealtimeMonitor:
     def get_status(self, cursor_id: str = "default") -> ObserverStatus:
         wf, init_at = self.state_store.get_watch_config(self.account_id, cursor_id)
         watermarks = self.state_store.get_watermarks(self.account_id, cursor_id)
+        init_done = init_at is not None
         return ObserverStatus(
             account_id=self.account_id,
             wxid=self.repo.get_own_wxid(),
@@ -69,7 +70,7 @@ class RealtimeMonitor:
             online=self.repo.account.online,
             db_dir=os_dirname_safe(self.repo.account.data_dir),
             cursor_id=cursor_id,
-            initialized=init_at is not None,
+            initialized=init_done,
             initialized_at=init_at,
             watch_filter=wf,
             tracked_chats=len(watermarks),
@@ -77,6 +78,8 @@ class RealtimeMonitor:
             keyed_dbs=self.repo.keyed_db_count,
             unkeyed_dbs=self.repo.unkeyed_dbs,
             warnings=self.repo.warnings,
+            watch_initialized=init_done,
+            ready=self.repo.keyed_db_count > 0,
         )
 
     @staticmethod

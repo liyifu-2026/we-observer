@@ -14,9 +14,12 @@ Requirements: **64-bit Windows 10 / 11**, **64-bit Python 3.11+**, and desktop *
 
 ```powershell
 python -m venv .venv
+python -m pip --python .\.venv\Scripts\python.exe install --upgrade pip setuptools wheel
 .\.venv\Scripts\python.exe -m pip install -e .
 .\.venv\Scripts\wx-observer.exe --help
 ```
+
+> If `python -m venv .venv` fails with an `ensurepip` error on a stripped Python build, create the venv with `python -m venv --without-pip .venv` and run the second line (`python -m pip --python ...`) directly to bootstrap pip.
 
 ### Add MCP Server Support (`[mcp]`)
 
@@ -59,22 +62,37 @@ print(format_markdown([message]))
 
 ## 2. CLI Reference
 
-Add `--help` after any subcommand for full flags (e.g. `wx-observer digest --help`). Global flags (`--db-dir`, `--keys-file`, `--state-dir`, `--json`) can be passed before or after the subcommand.
+Add `--help` after any subcommand for full flags (e.g. `wx-observer digest --help`). Global flags (`--db-dir`, `--keys-file`, `--state-dir`, `--no-key-cache`, `--audit`, `--json`) can be passed before or after the subcommand.
 
 | Command | Purpose | Example |
 | --- | --- | --- |
 | `accounts` | List discovered WeChat directories and live `Weixin.exe` PIDs | `wx-observer accounts --json` |
-| `chats` | Filter private/group chats by name, remark, or `chat_id` | `wx-observer chats --type group --query "读书"` |
+| `verify` | Run 3-line health check: account count, quick_check, and latest message | `wx-observer verify` |
+| `doctor` | Collect redacted OS/Python/WeChat/shard diagnostics (or zip bundle) | `wx-observer doctor --bundle doctor.zip` |
+| `chats` | Filter private/group chats by name, remark, or `chat_id` | `wx-observer chats --type group --name-query "读书"` |
 | `history` | Read chat history and export to `md` / `csv` / `json` / `jsonl` | `wx-observer history "<chat>" --since 7d --export md --output out.md` |
-| `search` | Keyword search across chats or a single chat (with `--compact` snippets) | `wx-observer search "第三章" --since 30d --compact --skip-noise` |
+| `search` | Keyword search across chats (`--chats`, `--exclude`, `--min-activity`) | `wx-observer search "第三章" --since 30d --compact --skip-noise` |
 | `digest` | Single-pass cross-chat summary with counts, links, attachments, and highlights | `wx-observer digest --since 24h --max-chats 20 --token-budget 4000` |
 | `attachments` | List shared files (including forwarded records) and verify local paths | `wx-observer attachments --since 7d --ext pdf,docx --only-available` |
 | `watch` | Stream newly arriving messages continuously for an isolated `--cursor-id` | `wx-observer watch --cursor-id dev --mode group --jsonl` |
-| `mcp` | Run the MCP server over `stdio` or `127.0.0.1` Streamable HTTP | `wx-observer mcp --transport stdio` |
+| `mcp` | Run the MCP server (`stdio`/`http`) or generate client configs (`--print-config`) | `wx-observer mcp --print-config cursor` |
 
-CLI outputs default to full raw message fields (`detail="full"`). Pass `--compact` to shorten long text and include `est_tokens`, and `--skip-noise` to drop animated emoji placeholders while retaining system notices (marked `noise: true`).
+CLI outputs default to full raw message fields (`detail="full"`). Pass `--compact` to shorten long text (450-char `head_tail` default via `--truncate`) and include `est_tokens`, and `--skip-noise` to drop animated emoji placeholders while retaining system notices (marked `noise: true`).
 
 ## 3. MCP Server Configuration
+
+### Print Client-Ready Snippets (`--print-config`)
+
+Generate copy-pasteable configs with your active `.venv` executable path filled in automatically:
+
+```powershell
+.\.venv\Scripts\wx-observer.exe mcp --print-config cursor
+.\.venv\Scripts\wx-observer.exe mcp --print-config claude
+.\.venv\Scripts\wx-observer.exe mcp --print-config vscode
+.\.venv\Scripts\wx-observer.exe mcp --print-config codex
+.\.venv\Scripts\wx-observer.exe mcp --print-config cordis
+.\.venv\Scripts\wx-observer.exe mcp --print-config generic
+```
 
 ### `stdio` Transport (Client-Managed)
 
@@ -91,24 +109,30 @@ CLI outputs default to full raw message fields (`detail="full"`). Pass `--compac
 
 ### `Streamable HTTP` Transport (Persistent Localhost Daemon)
 
-Recommended when multiple clients or polls hit the same account so snapshots and key caches stay warm in memory:
+Recommended when multiple clients or polls hit the same account so snapshots and key caches stay warm in memory. Pass the Bearer token via `WX_OBSERVER_MCP_TOKEN` or `--token-file` instead of command-line `--token` (which exposes secrets in process listings):
 
 ```powershell
-.\.venv\Scripts\wx-observer.exe mcp --transport http --host 127.0.0.1 --port 8765 --token "replace-with-your-secret"
+$env:WX_OBSERVER_MCP_TOKEN = "replace-with-your-secret"
+.\.venv\Scripts\wx-observer.exe mcp --transport http --host 127.0.0.1 --port 8765
+# Or read from a restricted file:
+.\.venv\Scripts\wx-observer.exe mcp --transport http --host 127.0.0.1 --port 8765 --token-file .\mcp-token.txt
 ```
 
 Connect to `http://127.0.0.1:8765/mcp` with `Authorization: Bearer <token>`.
 
-### MCP Read-Only Tools (12 Total)
+### MCP Read-Only Tools (13 Total)
 
-| Category | Tools | Default Agent Ergonomics (`v0.3.2`) |
+| Category | Tools | Default Agent Ergonomics (`v0.4.0`) |
 | --- | --- | --- |
-| Account & Status | `list_accounts`, `select_account`, `get_status` | Explicit `account` is stateless and uses a 30s alias cache (with PID check) to avoid repeated system scans. |
-| History & Search | `list_chats`, `get_messages`, `search_messages` | Defaults to `detail="compact"` (300-char cap + `est_tokens`) and `skip_noise=True` (skips emojis, keeps `system` tagged `noise: true`). |
-| Digest & Files | `digest`, `list_attachments` | `digest` enforces `max_chats=20` and `token_budget=4000` across a 5-stage reducer; `list_attachments` resolves local paths with size/MD5 checks. |
+| Account & Status | `list_accounts`, `select_account`, `get_status` | Populates `display_name`/`alias` and top-level `self`; `get_status` exposes `ready`, `watch_initialized`, `key_cache_mode`, and `audit_path`/`audit_calls_today`. |
+| History & Search | `list_chats`, `get_messages`, `expand_chat_history`, `search_messages` | Unified `chat_type`, `name_query`, `chats`, `exclude_chats`; compact defaults to 450-char `head_tail` truncation, `ts_iso`, `untrusted: true`, and defused links. |
+| Digest & Files | `digest`, `list_attachments` | `digest` adds `self`, `is_self` in `top_senders`, ISO buckets, and `since_iso`/`until_iso`; `list_attachments` resolves embedded forwarded files and sets `next_action` when missing locally. |
 | Cursor Watch | `configure_watch`, `poll_new_messages`, `wait_for_messages`, `ack_messages` | Isolated per `cursor_id`; polling defaults to `peek=True` with `ack_token`; `ack_messages` replays are idempotent (`already_committed: true`). |
 
-All error responses return machine-readable `retryable` (`bool`) and `next_action` recovery guidance. Multi-consumer setups should assign a dedicated `cursor_id` instead of sharing `"default"`.
+Notes on fields & compatibility:
+- `ts_iso` provides timezone-aware ISO-8601 timestamps with year alongside short `t`; `seq` is the merged cross-shard millisecond-ordered sort key.
+- Deprecated aliases (`query` on `list_chats`, `scope` on `digest`/`list_attachments`, and `initialized` on `get_status`) remain supported for backward compatibility.
+- All error responses return machine-readable `retryable` (`bool`) and `next_action` recovery guidance. Multi-consumer setups should assign a dedicated `cursor_id` instead of sharing `"default"`.
 
 ## 4. Built-in Agent Skills
 

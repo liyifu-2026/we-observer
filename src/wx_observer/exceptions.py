@@ -48,7 +48,31 @@ _ERROR_RECOVERY: dict[str, tuple[bool, str]] = {
     ),
     "invalid_scope": (
         False,
-        "Use scope='all', 'private', or 'group'.",
+        "Use chat_type='all', 'private', or 'group' (scope is a deprecated alias).",
+    ),
+    "invalid_truncate": (
+        False,
+        "Use truncate='head', 'tail', 'head_tail', or 'none'.",
+    ),
+    "invalid_message_selector": (
+        False,
+        "Provide either seq (sort_seq) or message_id.",
+    ),
+    "message_not_found": (
+        False,
+        "Verify chat and seq/message_id via get_messages before retrying.",
+    ),
+    "invalid_token_config": (
+        False,
+        "Specify either --token-file or --token (or WX_OBSERVER_MCP_TOKEN), not conflicting flags.",
+    ),
+    "token_file_not_found": (
+        False,
+        "Verify the --token-file path exists and is readable.",
+    ),
+    "invalid_token_file": (
+        False,
+        "Ensure the token file contains a non-empty Bearer token.",
     ),
     "invalid_buckets": (
         False,

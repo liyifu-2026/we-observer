@@ -7,11 +7,18 @@ from collections import Counter, defaultdict
 from datetime import datetime
 from typing import Any
 
-from wx_observer.attachments import build_file_index, resolve_local_file
+from wx_observer.attachments import (
+    ATTACHMENT_NOT_DOWNLOADED_ACTION,
+    build_file_index,
+    resolve_local_file,
+)
 from wx_observer.models import MessageEvent
 from wx_observer.shaping import (
+    _truncate_text,
+    defuse_markdown_links,
     estimate_tokens,
     format_compact_time,
+    format_local_iso,
     is_noise_message,
     shape_message,
 )
@@ -30,7 +37,7 @@ def _bucket_label(ts: int, buckets: str) -> str:
         dt = datetime.fromtimestamp(ts)
         if buckets == "day":
             return dt.strftime("%Y-%m-%d")
-        return dt.strftime("%m-%d %H:00")
+        return dt.strftime("%Y-%m-%dT%H:00")
     except (OSError, OverflowError, ValueError):
         return ""
 
@@ -116,6 +123,7 @@ def build_digest(
     *,
     scope: str = "all",
     chats: list[str] | None = None,
+    exclude_chats: list[str] | None = None,
     since_ts: int | None = None,
     until_ts: int | None = None,
     buckets: str = "hour",
@@ -139,6 +147,11 @@ def build_digest(
         else set(ALL_DIGEST_SECTIONS)
     )
 
+    excluded_ids = {
+        repo.resolve_chat(ref).chat_id
+        for ref in (exclude_chats or [])
+        if ref and ref.strip()
+    }
     explicit_chats = bool(chats)
     if chats:
         target_chats = [repo.resolve_chat(ref) for ref in chats]
@@ -150,10 +163,12 @@ def build_digest(
             include_hidden=True,
             include_non_session=(since_ts is None),
         )
+    if excluded_ids:
+        target_chats = [c for c in target_chats if c.chat_id not in excluded_ids]
 
     file_index = build_file_index(repo.account.data_dir) if "attachments" in sections else None
     per_chat_out: list[dict[str, Any]] = []
-    global_senders: Counter[str] = Counter()
+    global_senders: Counter[tuple[str, bool]] = Counter()
     links_out: list[dict[str, Any]] = []
     seen_links: set[tuple[str, str]] = set()
     attachments_out: list[dict[str, Any]] = []
@@ -184,7 +199,7 @@ def build_digest(
             continue
 
         active_chats += 1
-        chat_senders: Counter[str] = Counter()
+        chat_senders: Counter[tuple[str, bool]] = Counter()
         chat_buckets: dict[str, int] = defaultdict(int)
         chat_type_counts: Counter[str] = Counter()
         signal_msgs: list[MessageEvent] = []
@@ -200,8 +215,9 @@ def build_digest(
                 continue
 
             signal_msgs.append(ev)
-            chat_senders[sender_label] += 1
-            global_senders[sender_label] += 1
+            sender_key = (sender_label, bool(ev.is_self))
+            chat_senders[sender_key] += 1
+            global_senders[sender_key] += 1
 
             b_key = _bucket_label(ev.timestamp, buckets)
             if b_key:
@@ -225,6 +241,7 @@ def build_digest(
                                 "chat_id": chat.chat_id,
                                 "sender": sender_label,
                                 "t": format_compact_time(ev.timestamp, ev.iso_time),
+                                "ts_iso": format_local_iso(ev.timestamp, ev.iso_time),
                                 "seq": ev.sort_seq,
                             }
                         )
@@ -266,6 +283,7 @@ def build_digest(
                             "chat_id": chat.chat_id,
                             "sender": sender_label,
                             "t": format_compact_time(ev.timestamp, ev.iso_time),
+                            "ts_iso": format_local_iso(ev.timestamp, ev.iso_time),
                             "seq": ev.sort_seq,
                             "_hints": (
                                 ev.timestamp,
@@ -279,6 +297,11 @@ def build_digest(
             if "mentions" in sections and ev.text:
                 found_mentions = _MENTION_RE.findall(ev.text)
                 if found_mentions:
+                    mention_text, _m_trunc, _m_len = _truncate_text(
+                        defuse_markdown_links(ev.text),
+                        max_text_chars,
+                        strategy="head_tail",
+                    )
                     mentions_out.append(
                         {
                             "targets": list(dict.fromkeys(found_mentions)),
@@ -286,8 +309,10 @@ def build_digest(
                             "chat_id": chat.chat_id,
                             "sender": sender_label,
                             "t": format_compact_time(ev.timestamp, ev.iso_time),
-                            "text": ev.text[:max_text_chars],
+                            "ts_iso": format_local_iso(ev.timestamp, ev.iso_time),
+                            "text": mention_text,
                             "seq": ev.sort_seq,
+                            "untrusted": True,
                         }
                     )
 
@@ -305,7 +330,8 @@ def build_digest(
                 chat_entry["buckets"] = dict(sorted(chat_buckets.items()))
         if "top_senders" in sections:
             chat_entry["top_senders"] = [
-                {"sender": name, "count": cnt} for name, cnt in chat_senders.most_common(5)
+                {"sender": name, "count": cnt, "is_self": is_self_flag}
+                for (name, is_self_flag), cnt in chat_senders.most_common(5)
             ]
         if "highlights" in sections and signal_msgs:
             ranked = sorted(signal_msgs, key=_highlight_score, reverse=True)[:max_highlights_per_chat]
@@ -315,6 +341,7 @@ def build_digest(
                     ev,
                     detail="compact",
                     max_text_chars=max_text_chars,
+                    truncate="head_tail",
                     include_chat=False,
                 )
                 for ev in ranked
@@ -341,15 +368,23 @@ def build_digest(
             entry["local_path"] = resolved["local_path"]
             if sz_val is None:
                 entry["size_bytes"] = resolved.get("actual_size_bytes")
+        if not entry.get("available"):
+            entry["next_action"] = ATTACHMENT_NOT_DOWNLOADED_ACTION
+        else:
+            entry.pop("next_action", None)
     kept_chats = per_chat_out[:max_chats_clamped]
     omitted_chats = max(0, len(per_chat_out) - len(kept_chats))
 
     result: dict[str, Any] = {
         "ok": True,
         "account_id": repo.account.account_id,
+        "self": repo.get_own_profile(),
         "window": {
             "since_ts": since_ts,
+            "since_iso": format_local_iso(since_ts) if since_ts is not None else None,
             "until_ts": until_ts,
+            "until_iso": format_local_iso(until_ts) if until_ts is not None else None,
+            "chat_type": scope,
             "scope": scope,
             "buckets": buckets,
             "max_chats": max_chats_clamped,
@@ -370,7 +405,8 @@ def build_digest(
     }
     if "top_senders" in sections:
         result["top_senders"] = [
-            {"sender": name, "count": cnt} for name, cnt in global_senders.most_common(10)
+            {"sender": name, "count": cnt, "is_self": is_self_flag}
+            for (name, is_self_flag), cnt in global_senders.most_common(10)
         ]
     if "links" in sections:
         result["links"] = links_out[:100]

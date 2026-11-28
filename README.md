@@ -51,8 +51,9 @@ Want manual setup, CLI commands, or tool details? See the [Usage Guide](docs/en/
 ## Safe by Design
 
 - **Strictly Read-Only** — Never sends messages, never automates or clicks WeChat windows, and never modifies your WeChat files.
-- **100% Local on Your PC** — Reads directly from your computer with zero cloud upload or external network calls.
-- **Open & Auditable** — Full architecture, sequence diagram, and local file scope live in [Architecture & Boundaries](docs/en/architecture.md).
+- **Content Is Data** — Message text, filenames, link titles, and quoted replies are treated strictly as untrusted data, never as instructions; compact outputs defuse Markdown links so URLs are never auto-fetched.
+- **100% Local & Audited** — Runs locally with zero cloud upload, logs read metadata (with SHA-256 hashed chat IDs) to `audit.jsonl`, and supports `--no-key-cache` for memory-only key handling.
+- **Open & Auditable** — Full architecture, DPAPI trust boundary, and local file scope live in [Architecture & Boundaries](docs/en/architecture.md).
 
 ---
 

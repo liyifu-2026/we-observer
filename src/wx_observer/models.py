@@ -32,6 +32,7 @@ class AccountInfo:
     online: bool
     pids: list[int] = field(default_factory=list)
     display_name: str = ""
+    alias: str = ""
     last_activity: float = 0.0
     selected: bool = False
     access_error: str | None = None
@@ -145,7 +146,11 @@ class ObserverStatus:
     keyed_dbs: int
     unkeyed_dbs: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    watch_initialized: bool = False
+    ready: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
+        payload["watch_initialized"] = bool(self.watch_initialized or self.initialized)
+        payload["ready"] = bool(self.ready)
         return payload

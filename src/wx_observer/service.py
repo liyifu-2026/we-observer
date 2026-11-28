@@ -12,14 +12,25 @@ from typing import Any
 
 import psutil
 
-from wx_observer.attachments import collect_attachments
+from wx_observer.attachments import build_file_index, collect_attachments, enrich_embedded_files
+from wx_observer.audit import AuditLogger
+from wx_observer.diagnostics import build_doctor_report, write_doctor_bundle
 from wx_observer.digest import build_digest
 from wx_observer.discovery import discover_environment
 from wx_observer.exceptions import AccountSelectionError, WxObserverError
 from wx_observer.models import AccountInfo, WatchFilter, WatchMode
 from wx_observer.monitor import RealtimeMonitor
-from wx_observer.repository import AccountRepository
-from wx_observer.shaping import estimate_tokens, shape_messages_batch
+from wx_observer.parser import parse_chat_history_xml
+from wx_observer.repository import AccountRepository, probe_account_profile
+from wx_observer.shaping import (
+    TRUNCATE_STRATEGIES,
+    _truncate_text,
+    defuse_markdown_links,
+    estimate_tokens,
+    format_compact_time,
+    format_local_iso,
+    shape_messages_batch,
+)
 from wx_observer.state import CursorStateStore
 
 _REL_TIME_RE = re.compile(r"^(\d+)\s*([smhdw])$", re.I)
@@ -63,6 +74,48 @@ def parse_timestamp(value: int | float | str | None) -> int | None:
     return int(dt.timestamp())
 
 
+def parse_min_activity(value: int | float | str | None) -> int | None:
+    """Parse min_activity as days ago (when <= 36500) or as a timestamp/relative window."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        num = int(value)
+        if 0 < num <= 36500:
+            return max(0, int(time.time()) - num * 86400)
+        return num
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.isdigit():
+        num = int(text)
+        if 0 < num <= 36500:
+            return max(0, int(time.time()) - num * 86400)
+        return num
+    return parse_timestamp(text)
+
+
+def _resolve_chat_type(chat_type: str | None, scope: str | None) -> str:
+    if chat_type is not None and scope is not None and chat_type != scope:
+        raise WxObserverError(
+            "invalid_scope",
+            f"Conflicting chat_type='{chat_type}' and deprecated scope='{scope}'.",
+        )
+    effective = chat_type if chat_type is not None else (scope if scope is not None else "all")
+    if effective not in ("all", "private", "group"):
+        raise WxObserverError("invalid_scope", f"Unsupported chat_type '{effective}'.")
+    return effective
+
+
+def _validate_truncate(truncate: str) -> str:
+    if truncate not in TRUNCATE_STRATEGIES:
+        raise WxObserverError(
+            "invalid_truncate",
+            f"Unsupported truncate strategy '{truncate}'.",
+            {"truncate": truncate},
+        )
+    return truncate
+
+
 def _norm_path_key(path: str | None) -> str | None:
     if not path:
         return None
@@ -80,11 +133,20 @@ class ObserverService:
         state_dir: str | Path | None = None,
         temp_root: str | Path | None = None,
         account_cache_ttl: float = 30.0,
+        use_key_cache: bool | None = None,
+        audit: str | Path | None = None,
     ) -> None:
         self.db_dir = db_dir
         self.keys_file = keys_file
         self.state_dir = Path(state_dir) if state_dir else None
         self.temp_root = Path(temp_root) if temp_root else None
+        env_no_cache = os.environ.get("WX_OBSERVER_NO_KEY_CACHE", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        self.use_key_cache = (not env_no_cache) if use_key_cache is None else bool(use_key_cache)
+        self.audit_logger = AuditLogger(audit, state_dir=self.state_dir)
 
         self._registry_lock = threading.RLock()
         self._state_store = CursorStateStore(state_dir=self.state_dir)
@@ -96,6 +158,14 @@ class ObserverService:
             tuple[str, int | None, str | None, str | None],
             tuple[tuple[str, int | None], float],
         ] = {}
+        self._profile_cache: dict[str, tuple[tuple[int, int], dict[str, str]]] = {}
+
+    @property
+    def key_cache_mode(self) -> str:
+        has_ext = bool(self.keys_file or os.environ.get("WX_OBSERVER_KEYS_FILE"))
+        if not self.use_key_cache:
+            return "external_file" if has_ext else "disabled"
+        return "dpapi"
 
     def close(self) -> None:
         with self._registry_lock:
@@ -106,7 +176,78 @@ class ObserverService:
             self._monitors.clear()
             self._repos.clear()
             self._alias_cache.clear()
+            self._profile_cache.clear()
             self._selected_key = None
+
+    def _resolve_account_profile(
+        self,
+        acct: AccountInfo,
+        repos_snapshot: list[tuple[tuple[str, int | None], AccountRepository]],
+    ) -> dict[str, str] | None:
+        for (rid, _rpid), repo in repos_snapshot:
+            if rid == acct.account_id:
+                return repo.get_own_profile()
+
+        contact_stamp: tuple[int, int] | None = None
+        for cand in (
+            Path(acct.db_storage_dir) / "contact" / "contact.db",
+            Path(acct.db_storage_dir) / "contact.db",
+        ):
+            if cand.is_file():
+                try:
+                    st = cand.stat()
+                    contact_stamp = (st.st_mtime_ns, st.st_size)
+                except OSError:
+                    contact_stamp = (-1, -1)
+                break
+
+        with self._registry_lock:
+            cached = self._profile_cache.get(acct.account_id)
+            if cached is not None and contact_stamp is not None and cached[0] == contact_stamp:
+                return dict(cached[1])
+
+        probed = probe_account_profile(
+            acct,
+            keys_file=self.keys_file,
+            state_dir=self.state_dir,
+            use_key_cache=self.use_key_cache,
+            temp_root=self.temp_root,
+        )
+        if probed is not None:
+            prof = {
+                "wxid": probed["wxid"],
+                "display_name": probed["display_name"],
+                "alias": probed["alias"],
+            }
+            with self._registry_lock:
+                self._profile_cache[acct.account_id] = (probed["stamp"], prof)
+            return dict(prof)
+        return None
+
+    @staticmethod
+    def _pick_self_profile(
+        accounts_out: list[dict[str, Any]],
+        selected_acct: str | None,
+    ) -> dict[str, str] | None:
+        chosen: dict[str, Any] | None = None
+        if selected_acct:
+            for row in accounts_out:
+                if row.get("account_id") == selected_acct:
+                    chosen = row
+                    break
+        if chosen is None:
+            online_rows = [row for row in accounts_out if row.get("online")]
+            if len(online_rows) == 1:
+                chosen = online_rows[0]
+            elif len(accounts_out) == 1:
+                chosen = accounts_out[0]
+        if chosen is None:
+            return None
+        return {
+            "wxid": str(chosen.get("wxid") or ""),
+            "display_name": str(chosen.get("display_name") or ""),
+            "alias": str(chosen.get("alias") or ""),
+        }
 
     def list_accounts(self, *, db_dir: str | None = None) -> dict[str, Any]:
         with self._registry_lock:
@@ -119,15 +260,17 @@ class ObserverService:
         accounts_out: list[dict[str, Any]] = []
         for acct in env["accounts"]:
             row = acct.to_dict()
-            for (rid, _rpid), repo in repos_snapshot:
-                if rid == acct.account_id:
-                    row["display_name"] = repo.get_own_display_name()
-                    break
+            prof = self._resolve_account_profile(acct, repos_snapshot)
+            if prof:
+                row["wxid"] = prof["wxid"] or row["wxid"]
+                row["display_name"] = prof["display_name"]
+                row["alias"] = prof["alias"]
             accounts_out.append(row)
         return {
             "ok": True,
             "db_dir": env["db_dir"],
             "selected_account": selected_acct,
+            "self": self._pick_self_profile(accounts_out, selected_acct),
             "accounts": accounts_out,
             "processes": [p.to_dict() for p in env["processes"]],
             "access_denied": env["access_denied"],
@@ -286,6 +429,7 @@ class ObserverService:
                     keys_file=eff_keys,
                     temp_root=self.temp_root,
                     target_pids=target_pids,
+                    use_key_cache=self.use_key_cache,
                 )
                 mon = RealtimeMonitor(repo, self._state_store)
                 self._repos[cache_key] = repo
@@ -331,10 +475,13 @@ class ObserverService:
             make_default=True,
             refresh=True,
         )
+        profile = repo.get_own_profile()
         chosen.selected = True
-        chosen.display_name = repo.get_own_display_name()
+        chosen.display_name = profile["display_name"]
+        chosen.alias = profile["alias"]
         return {
             "ok": True,
+            "self": profile,
             "account": chosen.to_dict(),
             "total_dbs": repo.total_db_count,
             "keyed_dbs": repo.keyed_db_count,
@@ -345,13 +492,15 @@ class ObserverService:
         self,
         *,
         chat_type: str = "all",
+        name_query: str | None = None,
         query: str | None = None,
         limit: int = 50,
         account: str | None = None,
         pid: int | None = None,
     ) -> dict[str, Any]:
         repo, _mon, _chosen = self._open_or_reuse(account=account, pid=pid, make_default=False)
-        chats = repo.list_chats(chat_type=chat_type, query=query, limit=limit)
+        eff_query = name_query if name_query is not None else query
+        chats = repo.list_chats(chat_type=chat_type, query=eff_query, limit=limit)
         payload: dict[str, Any] = {
             "ok": True,
             "account_id": repo.account.account_id,
@@ -376,10 +525,12 @@ class ObserverService:
         include_self: bool = True,
         detail: str = "full",
         max_text_chars: int | None = None,
+        truncate: str = "head_tail",
         skip_noise: bool = False,
         account: str | None = None,
         pid: int | None = None,
     ) -> dict[str, Any]:
+        _validate_truncate(truncate)
         repo, _mon, _chosen = self._open_or_reuse(account=account, pid=pid, make_default=False)
         chat_info = repo.resolve_chat(chat)
         since_ts = parse_timestamp(since)
@@ -397,10 +548,26 @@ class ObserverService:
             keyword=keyword,
             include_self=include_self,
         )
+        ch_events = [
+            ev
+            for ev in result["messages"]
+            if ev.msg_type == "chat_history" and ev.metadata.get("embedded_files")
+        ]
+        if ch_events:
+            file_index = build_file_index(repo.account.data_dir)
+            for ev in ch_events:
+                ev.metadata["embedded_files"] = enrich_embedded_files(
+                    repo.account.data_dir,
+                    ev.metadata["embedded_files"],
+                    ev.timestamp,
+                    file_index=file_index,
+                    verify_md5=True,
+                )
         shaped, skipped_noise = shape_messages_batch(
             result["messages"],
             detail=detail,
             max_text_chars=max_text_chars,
+            truncate=truncate,
             skip_noise=skip_noise,
             include_chat=False,
         )
@@ -419,14 +586,110 @@ class ObserverService:
         payload["est_tokens"] = estimate_tokens(payload)
         return payload
 
+    def expand_chat_history(
+        self,
+        chat: str,
+        *,
+        seq: int | None = None,
+        message_id: str | int | None = None,
+        max_text_chars: int | None = None,
+        account: str | None = None,
+        pid: int | None = None,
+    ) -> dict[str, Any]:
+        """Expand a forwarded chat_history message into items and resolve embedded files."""
+        repo, _mon, _chosen = self._open_or_reuse(account=account, pid=pid, make_default=False)
+        chat_info = repo.resolve_chat(chat)
+        raw_hit = repo.get_chat_history_raw(
+            chat_info.chat_id,
+            chat_name=chat_info.display_name,
+            seq=seq,
+            message_id=message_id,
+        )
+        ev = raw_hit["event"]
+        parsed = parse_chat_history_xml(raw_hit["xml_body"], sender_id=ev.sender_id or None)
+        file_index = build_file_index(repo.account.data_dir)
+
+        def _enrich_items(
+            items: list[dict[str, Any]],
+        ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+            out_items: list[dict[str, Any]] = []
+            out_files: list[dict[str, Any]] = []
+            for raw_item in items:
+                item = dict(raw_item)
+                item["untrusted"] = True
+                if isinstance(item.get("text"), str):
+                    txt = defuse_markdown_links(item["text"])
+                    if max_text_chars is not None and max_text_chars > 0:
+                        txt, was_trunc, orig_len = _truncate_text(
+                            txt, max_text_chars, strategy="head_tail"
+                        )
+                        if was_trunc:
+                            item["truncated"] = True
+                            item["full_length"] = orig_len
+                    item["text"] = txt
+                if item.get("msg_type") == "file" and isinstance(item.get("meta"), dict):
+                    enriched_list = enrich_embedded_files(
+                        repo.account.data_dir,
+                        [item["meta"]],
+                        ev.timestamp,
+                        file_index=file_index,
+                        verify_md5=True,
+                    )
+                    if enriched_list:
+                        f_meta = enriched_list[0]
+                        item["meta"] = f_meta
+                        item["available"] = f_meta["available"]
+                        item["local_path"] = f_meta["local_path"]
+                        if "next_action" in f_meta:
+                            item["next_action"] = f_meta["next_action"]
+                        out_files.append(dict(f_meta))
+                if isinstance(item.get("items"), list):
+                    sub_items, sub_files = _enrich_items(item["items"])
+                    item["items"] = sub_items
+                    out_files.extend(sub_files)
+                out_items.append(item)
+            return out_items, out_files
+
+        items_out, embedded_files_out = _enrich_items(parsed["items"])
+        if not embedded_files_out and parsed["embedded_files"]:
+            embedded_files_out = enrich_embedded_files(
+                repo.account.data_dir,
+                parsed["embedded_files"],
+                ev.timestamp,
+                file_index=file_index,
+                verify_md5=True,
+            )
+
+        payload: dict[str, Any] = {
+            "ok": True,
+            "account_id": repo.account.account_id,
+            "chat": chat_info.to_dict(),
+            "event_id": ev.event_id,
+            "seq": ev.sort_seq,
+            "timestamp": ev.timestamp,
+            "ts_iso": format_local_iso(ev.timestamp, ev.iso_time),
+            "sender": ev.sender_name or ev.sender_id or ("我" if ev.is_self else ""),
+            "title": parsed["title"] or ev.metadata.get("title") or "",
+            "item_count": len(items_out),
+            "items": items_out,
+            "embedded_files_count": len(embedded_files_out),
+            "available_files_count": sum(1 for f in embedded_files_out if f.get("available")),
+            "embedded_files": embedded_files_out,
+        }
+        payload["est_tokens"] = estimate_tokens(payload)
+        return payload
+
     def search_messages(
         self,
         keyword: str,
         *,
         chat: str | None = None,
+        chats: list[str] | None = None,
+        exclude_chats: list[str] | None = None,
         chat_type: str = "all",
         since: int | float | str | None = None,
         until: int | float | str | None = None,
+        min_activity: int | float | str | None = None,
         limit: int = 50,
         detail: str = "full",
         max_text_chars: int | None = None,
@@ -437,16 +700,20 @@ class ObserverService:
         repo, _mon, _chosen = self._open_or_reuse(account=account, pid=pid, make_default=False)
         since_ts = parse_timestamp(since)
         until_ts = parse_timestamp(until)
-        events = repo.search_messages(
+        min_activity_ts = parse_min_activity(min_activity)
+        search_res = repo.search_messages_detailed(
             keyword,
             chat_id=chat,
+            chats=chats,
+            exclude_chats=exclude_chats,
             chat_type=chat_type,
             since_ts=since_ts,
             until_ts=until_ts,
+            min_activity_ts=min_activity_ts,
             limit=limit,
         )
         shaped, skipped_noise = shape_messages_batch(
-            events,
+            search_res["messages"],
             detail=detail,
             max_text_chars=max_text_chars,
             skip_noise=skip_noise,
@@ -459,6 +726,9 @@ class ObserverService:
             "detail": detail,
             "keyword": keyword,
             "count": len(shaped),
+            "total_matched": search_res["total_matched"],
+            "scanned_chats": search_res["scanned_chats"],
+            "truncated": search_res["truncated"],
             "skipped_noise": skipped_noise,
             "messages": shaped,
         }
@@ -513,10 +783,12 @@ class ObserverService:
         peek: bool = False,
         detail: str = "full",
         max_text_chars: int | None = None,
+        truncate: str = "head_tail",
         skip_noise: bool = False,
         account: str | None = None,
         pid: int | None = None,
     ) -> dict[str, Any]:
+        _validate_truncate(truncate)
         repo, mon, _chosen = self._open_or_reuse(account=account, pid=pid, make_default=False)
         batch = mon.poll_batch(
             cursor_id=cursor_id,
@@ -529,6 +801,7 @@ class ObserverService:
             batch.events,
             detail=detail,
             max_text_chars=max_text_chars,
+            truncate=truncate,
             skip_noise=False,
             include_chat=True,
         )
@@ -537,6 +810,7 @@ class ObserverService:
             "account_id": repo.account.account_id,
             "cursor_id": cursor_id,
             "initialized": status.initialized,
+            "watch_initialized": status.watch_initialized,
             "peek": peek,
             "ack_token": batch.ack_token,
             "detail": detail,
@@ -579,10 +853,12 @@ class ObserverService:
         peek: bool = False,
         detail: str = "full",
         max_text_chars: int | None = None,
+        truncate: str = "head_tail",
         skip_noise: bool = False,
         account: str | None = None,
         pid: int | None = None,
     ) -> dict[str, Any]:
+        _validate_truncate(truncate)
         repo, mon, _chosen = self._open_or_reuse(account=account, pid=pid, make_default=False)
         batch = mon.wait_for_batch(
             cursor_id=cursor_id,
@@ -596,6 +872,7 @@ class ObserverService:
             batch.events,
             detail=detail,
             max_text_chars=max_text_chars,
+            truncate=truncate,
             skip_noise=False,
             include_chat=True,
         )
@@ -617,8 +894,10 @@ class ObserverService:
     def digest(
         self,
         *,
-        scope: str = "all",
+        chat_type: str | None = None,
+        scope: str | None = None,
         chats: list[str] | None = None,
+        exclude_chats: list[str] | None = None,
         since: int | float | str | None = "24h",
         until: int | float | str | None = None,
         buckets: str = "hour",
@@ -631,8 +910,7 @@ class ObserverService:
         account: str | None = None,
         pid: int | None = None,
     ) -> dict[str, Any]:
-        if scope not in ("all", "private", "group"):
-            raise WxObserverError("invalid_scope", f"Unsupported scope '{scope}'.")
+        effective_scope = _resolve_chat_type(chat_type, scope)
         if buckets not in ("hour", "day", "none"):
             raise WxObserverError("invalid_buckets", f"Unsupported buckets '{buckets}'.")
         repo, _mon, _chosen = self._open_or_reuse(account=account, pid=pid, make_default=False)
@@ -640,8 +918,9 @@ class ObserverService:
         until_ts = parse_timestamp(until)
         return build_digest(
             repo,
-            scope=scope,
+            scope=effective_scope,
             chats=chats,
+            exclude_chats=exclude_chats,
             since_ts=since_ts,
             until_ts=until_ts,
             buckets=buckets,
@@ -656,29 +935,33 @@ class ObserverService:
     def list_attachments(
         self,
         *,
-        scope: str = "all",
+        chat_type: str | None = None,
+        scope: str | None = None,
         chats: list[str] | None = None,
+        exclude_chats: list[str] | None = None,
         since: int | float | str | None = "7d",
         until: int | float | str | None = None,
         extensions: list[str] | None = None,
         only_available: bool = False,
+        include_embedded: bool = True,
         limit: int = 50,
         account: str | None = None,
         pid: int | None = None,
     ) -> dict[str, Any]:
-        if scope not in ("all", "private", "group"):
-            raise WxObserverError("invalid_scope", f"Unsupported scope '{scope}'.")
+        effective_scope = _resolve_chat_type(chat_type, scope)
         repo, _mon, _chosen = self._open_or_reuse(account=account, pid=pid, make_default=False)
         since_ts = parse_timestamp(since)
         until_ts = parse_timestamp(until)
         return collect_attachments(
             repo,
-            scope=scope,
+            scope=effective_scope,
             chats=chats,
+            exclude_chats=exclude_chats,
             since_ts=since_ts,
             until_ts=until_ts,
             extensions=extensions,
             only_available=only_available,
+            include_embedded=include_embedded,
             limit=limit,
         )
 
@@ -707,22 +990,104 @@ class ObserverService:
         account: str | None = None,
         pid: int | None = None,
     ) -> dict[str, Any]:
+        audit_info = {
+            "audit_enabled": self.audit_logger.enabled,
+            "audit_path": str(self.audit_logger.path) if self.audit_logger.path else None,
+            "audit_calls_today": self.audit_logger.calls_today(),
+            "key_cache_mode": self.key_cache_mode,
+        }
         with self._registry_lock:
             selected_key = self._selected_key
+            repos_snapshot = list(self._repos.items())
         if account is None and pid is None and selected_key is None:
             env = discover_environment(db_dir=self.db_dir)
+            accounts_out: list[dict[str, Any]] = []
+            for acct in env["accounts"]:
+                row = acct.to_dict()
+                prof = self._resolve_account_profile(acct, repos_snapshot)
+                if prof:
+                    row["wxid"] = prof["wxid"] or row["wxid"]
+                    row["display_name"] = prof["display_name"]
+                    row["alias"] = prof["alias"]
+                accounts_out.append(row)
+            online_count = sum(1 for a in env["accounts"] if a.online)
+            ready = bool(online_count == 1 or (self.keys_file and len(env["accounts"]) == 1))
             return {
                 "ok": True,
                 "selected": False,
+                "ready": ready,
+                "watch_initialized": False,
+                "self": self._pick_self_profile(accounts_out, None),
                 "db_dir": env["db_dir"],
                 "accounts_count": len(env["accounts"]),
-                "online_accounts_count": sum(1 for a in env["accounts"] if a.online),
+                "online_accounts_count": online_count,
                 "reason": env["reason"],
+                **audit_info,
             }
-        _repo, mon, _chosen = self._open_or_reuse(account=account, pid=pid, make_default=False)
+        repo, mon, _chosen = self._open_or_reuse(account=account, pid=pid, make_default=False)
         status = mon.get_status(cursor_id=cursor_id)
         return {
             "ok": True,
             "selected": True,
+            "ready": status.ready,
+            "watch_initialized": status.watch_initialized,
+            "self": repo.get_own_profile(),
+            **audit_info,
             "status": status.to_dict(),
         }
+
+    def verify(
+        self,
+        *,
+        account: str | None = None,
+        pid: int | None = None,
+    ) -> dict[str, Any]:
+        """Run end-to-end discovery, decryption, quick_check, and latest-message verification."""
+        env = discover_environment(db_dir=self.db_dir)
+        accounts = env["accounts"]
+        online_count = sum(1 for a in accounts if a.online)
+        offline_count = len(accounts) - online_count
+        repo, _mon, chosen = self._open_or_reuse(account=account, pid=pid, make_default=False)
+        health = repo.verify_health()
+        latest_ts = int(health["latest_timestamp"] or 0)
+        ok = bool(health["quick_check_passed"])
+        res: dict[str, Any] = {
+            "ok": ok,
+            "account_id": chosen.account_id,
+            "self": repo.get_own_profile(),
+            "accounts_total": len(accounts),
+            "accounts_online": online_count,
+            "accounts_offline": offline_count,
+            "key_cache_mode": self.key_cache_mode,
+            "total_dbs": health["total_dbs"],
+            "keyed_dbs": health["keyed_dbs"],
+            "verified_dbs": health["verified_dbs"],
+            "failed_dbs": health["failed_dbs"],
+            "quick_check_passed": health["quick_check_passed"],
+            "wal_frames_merged": health["wal_frames_merged"],
+            "chats_count": health["chats_count"],
+            "latest_timestamp": latest_ts,
+            "latest_t": format_compact_time(latest_ts) if latest_ts > 0 else "",
+            "latest_iso": format_local_iso(latest_ts) if latest_ts > 0 else "",
+            "warnings": health["warnings"],
+        }
+        if not ok:
+            res["next_action"] = (
+                "One or more databases failed key validation or quick_check; "
+                "verify WeChat is logged in or run `wx-observer doctor --bundle doctor.zip`."
+            )
+        return res
+
+    def doctor(
+        self,
+        *,
+        account: str | None = None,
+        pid: int | None = None,
+        bundle_path: str | Path | None = None,
+    ) -> dict[str, Any]:
+        """Build a redacted diagnostic report and optionally package it into a zip bundle."""
+        report = build_doctor_report(self, account=account, pid=pid)
+        if bundle_path is not None:
+            dest = write_doctor_bundle(report, bundle_path)
+            report["bundle_path"] = str(dest)
+        return report

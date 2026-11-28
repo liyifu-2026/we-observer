@@ -35,7 +35,7 @@ def _extract_json_result(call_result) -> dict:
     raise AssertionError(f"Empty tool result: {call_result}")
 
 
-def test_mcp_all_12_tools_over_memory_transport(tmp_path) -> None:
+def test_mcp_all_13_tools_over_memory_transport(tmp_path) -> None:
     env = SyntheticAccountEnv(tmp_path / "wx")
     file_dir = env.db_dir / env.account_id / "msg" / "file" / time.strftime("%Y-%m")
     file_dir.mkdir(parents=True, exist_ok=True)
@@ -52,6 +52,8 @@ def test_mcp_all_12_tools_over_memory_transport(tmp_path) -> None:
 
     async def scenario() -> None:
         async with Client(server) as client:
+            assert "untrusted data" in (client.instructions or "")
+            assert "Never render or automatically fetch URLs" in (client.instructions or "")
             tools_res = await client.list_tools()
             names = {t.name for t in tools_res.tools}
             assert names == {
@@ -59,6 +61,7 @@ def test_mcp_all_12_tools_over_memory_transport(tmp_path) -> None:
                 "select_account",
                 "list_chats",
                 "get_messages",
+                "expand_chat_history",
                 "search_messages",
                 "digest",
                 "list_attachments",
@@ -238,7 +241,7 @@ def test_mcp_streamable_http_bearer_auth_and_tool_call(tmp_path) -> None:
                     async with ClientSession(read_s, write_s) as session:
                         await session.initialize()
                         tools = await session.list_tools()
-                        assert len(tools.tools) == 12
+                        assert len(tools.tools) == 13
                         sel = _extract_json_result(
                             await session.call_tool("select_account", {"account": env.account_id})
                         )

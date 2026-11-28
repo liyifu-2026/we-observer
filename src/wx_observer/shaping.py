@@ -11,6 +11,9 @@ from wx_observer.models import MessageEvent
 
 NOISE_MSG_TYPES = frozenset({"emoji"})
 LOW_SIGNAL_MSG_TYPES = frozenset({"system"})
+DEFAULT_COMPACT_MAX_CHARS = 450
+TRUNCATE_STRATEGIES = frozenset({"head", "tail", "head_tail", "none"})
+_MD_LINK_RE = re.compile(r"\]\(\s*(https?://)", re.I)
 
 _COMPACT_META_KEYS = (
     "filename",
@@ -28,6 +31,23 @@ _COMPACT_META_KEYS = (
 def is_noise_message(event: MessageEvent) -> bool:
     """Return True for pure chat noise such as animated sticker/emoji placeholders."""
     return event.msg_type in NOISE_MSG_TYPES
+
+
+def defuse_markdown_links(text: str) -> str:
+    """Break markdown link/image syntax like [label](https://...) so clients cannot auto-render or fetch URLs."""
+    if not text:
+        return ""
+    return _MD_LINK_RE.sub(r"] (\1", text)
+
+
+def format_local_iso(ts: int, iso_fallback: str = "") -> str:
+    """Format epoch seconds as a timezone-aware local ISO-8601 timestamp including year."""
+    if ts > 0:
+        try:
+            return datetime.fromtimestamp(ts).astimezone().isoformat(timespec="seconds")
+        except (OSError, OverflowError, ValueError):
+            pass
+    return iso_fallback or ""
 
 
 def estimate_tokens(payload: Any) -> int:
@@ -72,38 +92,71 @@ def extract_snippet(text: str, keyword: str, *, radius: int = 80) -> tuple[str, 
     return f"{prefix}{body[start:end]}{suffix}", idx, (start > 0 or end < len(body))
 
 
-def _truncate_text(text: str, max_text_chars: int | None) -> tuple[str, bool, int]:
+def _truncate_text(
+    text: str,
+    max_text_chars: int | None,
+    strategy: str = "head_tail",
+) -> tuple[str, bool, int]:
+    if strategy not in TRUNCATE_STRATEGIES:
+        raise ValueError(f"Unsupported truncate strategy: {strategy}")
     orig = text or ""
     orig_len = len(orig)
-    if max_text_chars is not None and max_text_chars > 0 and orig_len > max_text_chars:
-        return orig[:max_text_chars].rstrip() + "...", True, orig_len
-    return orig, False, orig_len
+    if strategy == "none" or max_text_chars is None or max_text_chars <= 0 or orig_len <= max_text_chars:
+        return orig, False, orig_len
+    if max_text_chars == 1:
+        return (orig[-1:] if strategy == "tail" else orig[:1]), True, orig_len
+
+    sep = "…"
+    budget = max_text_chars - 1
+    if strategy == "head":
+        return orig[:budget].rstrip() + sep, True, orig_len
+    if strategy == "tail":
+        return sep + orig[-budget:].lstrip(), True, orig_len
+
+    # Preserve both opening context and trailing deadlines/amounts in head_tail mode.
+    head_len = max(1, int(budget * 0.7))
+    tail_len = budget - head_len
+    if tail_len <= 0:
+        return orig[:budget].rstrip() + sep, True, orig_len
+    head = orig[:head_len].rstrip()
+    tail = orig[-tail_len:].lstrip()
+    return f"{head}{sep}{tail}", True, orig_len
 
 
 def shape_message(
     event: MessageEvent,
     *,
     detail: str = "compact",
-    max_text_chars: int | None = 300,
+    max_text_chars: int | None = DEFAULT_COMPACT_MAX_CHARS,
+    truncate: str = "head_tail",
     include_chat: bool = False,
     snippet_keyword: str | None = None,
 ) -> dict[str, Any]:
     """Project a MessageEvent into compact (LLM-friendly) or full (raw) dictionary form."""
     if detail not in ("compact", "full"):
         raise ValueError(f"Unsupported detail mode: {detail}")
+    if truncate not in TRUNCATE_STRATEGIES:
+        raise ValueError(f"Unsupported truncate strategy: {truncate}")
 
+    source_text = defuse_markdown_links(event.text or "") if detail == "compact" else (event.text or "")
     if snippet_keyword:
         radius = max(40, (max_text_chars // 2) if (max_text_chars and max_text_chars > 0) else 80)
         rendered_text, match_offset, was_truncated = extract_snippet(
-            event.text, snippet_keyword, radius=radius
+            source_text, snippet_keyword, radius=radius
         )
-        orig_len = len(event.text or "")
+        orig_len = len(source_text)
     else:
-        rendered_text, was_truncated, orig_len = _truncate_text(event.text, max_text_chars)
+        rendered_text, was_truncated, orig_len = _truncate_text(
+            source_text, max_text_chars, strategy=truncate
+        )
         match_offset = -1
+
+    ts_iso = format_local_iso(event.timestamp, event.iso_time)
 
     if detail == "full":
         out = event.to_dict()
+        out["ts_iso"] = ts_iso
+        out["untrusted"] = True
         if was_truncated:
             out["text"] = rendered_text
             out["truncated"] = True
@@ -115,10 +168,12 @@ def shape_message(
     sender = event.sender_name or event.sender_id or ("我" if event.is_self else "")
     out = {
         "t": format_compact_time(event.timestamp, event.iso_time),
+        "ts_iso": ts_iso,
         "sender": sender,
         "type": event.msg_type,
         "text": rendered_text,
         "seq": event.sort_seq,
+        "untrusted": True,
     }
     if include_chat:
         out["chat"] = event.chat_name or event.chat_id
@@ -134,7 +189,7 @@ def shape_message(
         out["match_offset"] = match_offset
     if event.quote is not None and event.quote.excerpt:
         q_who = event.quote.sender_name or event.quote.sender_id or ""
-        excerpt = event.quote.excerpt[:100]
+        excerpt = defuse_markdown_links(event.quote.excerpt)[:100]
         out["quote"] = f"{q_who}: {excerpt}" if q_who else excerpt
     if event.metadata:
         compact_meta = {
@@ -151,7 +206,8 @@ def shape_messages_batch(
     events: list[MessageEvent],
     *,
     detail: str = "compact",
-    max_text_chars: int | None = 300,
+    max_text_chars: int | None = DEFAULT_COMPACT_MAX_CHARS,
+    truncate: str = "head_tail",
     skip_noise: bool = True,
     include_chat: bool = False,
     snippet_keyword: str | None = None,
@@ -168,6 +224,7 @@ def shape_messages_batch(
                 ev,
                 detail=detail,
                 max_text_chars=max_text_chars,
+                truncate=truncate,
                 include_chat=include_chat,
                 snippet_keyword=snippet_keyword,
             )

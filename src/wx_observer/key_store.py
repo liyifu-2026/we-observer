@@ -20,6 +20,36 @@ DPAPI_PREFIX = b"WXOBS-DPAPI-V1:"
 DEFAULT_APP_DIR_NAME = "wx-observer"
 
 
+def get_current_user_sid() -> str | None:
+    """Return the current Windows user SID string, or None when unavailable."""
+    if os.name != "nt":
+        return None
+    token_handle = None
+    try:
+        import win32api  # type: ignore
+        import win32security  # type: ignore
+
+        token_handle = win32security.OpenProcessToken(
+            win32api.GetCurrentProcess(),
+            win32security.TOKEN_QUERY,
+        )
+        user_sid, _attrs = win32security.GetTokenInformation(
+            token_handle,
+            win32security.TokenUser,
+        )
+        return str(win32security.ConvertSidToStringSid(user_sid))
+    except Exception:
+        return None
+    finally:
+        if token_handle is not None:
+            try:
+                import win32api  # type: ignore
+
+                win32api.CloseHandle(token_handle)
+            except Exception:
+                pass
+
+
 def default_state_dir() -> Path:
     local = os.environ.get("LOCALAPPDATA")
     if local:
@@ -88,16 +118,25 @@ class KeyStore:
         if not isinstance(decoded, dict):
             return {}
 
+        stored_sid = decoded.get("owner_sid")
+        if isinstance(stored_sid, str) and stored_sid:
+            current_sid = get_current_user_sid()
+            if current_sid and stored_sid != current_sid:
+                return {}
+
         raw_map = decoded.get("keys") if isinstance(decoded.get("keys"), dict) else decoded
         return validate_hex_key_map(raw_map, db_files)
 
     def save_cached_keys(self, account_id: str, keys: dict[str, bytes]) -> Path:
         self.keys_dir.mkdir(parents=True, exist_ok=True)
-        payload_dict = {
-            "version": 1,
+        payload_dict: dict[str, Any] = {
+            "version": 2,
             "account_id": account_id,
             "keys": {rel: key.hex() for rel, key in sorted(keys.items())},
         }
+        owner_sid = get_current_user_sid()
+        if owner_sid:
+            payload_dict["owner_sid"] = owner_sid
         encoded = json.dumps(payload_dict, ensure_ascii=False).encode("utf-8")
         protected = dpapi_protect(encoded)
         target = self.cache_path(account_id)
