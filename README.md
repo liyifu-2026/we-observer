@@ -48,10 +48,16 @@ Install wx-observer from https://github.com/liyifu-2026/we-observer, configure i
 
 Want manual setup, CLI commands, or tool details? See the [Usage Guide](docs/en/guide.md).
 
+## What's New in v0.4.0
+
+- **Zero-Guess Onboarding & Diagnostics** — `wx-observer verify` checks core DB decryption (degrading gracefully if optional `*_fts.db` shards fail), `wx-observer doctor --bundle doctor.zip` builds a redacted diagnostic archive, and `wx-observer mcp --print-config <client>` prints ready-to-paste MCP snippets (`cursor`, `claude`, `vscode`, `codex`, `cordis`, `generic`).
+- **Forwarded Record Expansion** — New `expand_chat_history` MCP tool unpacks forwarded `chat_history` bundles (default `limit=20`, `0` for all) and resolves embedded local file paths alongside `list_attachments`.
+- **Stronger Defaults & Audit Trail** — Self identity (`self`, `top_senders[].is_self`), `head_tail` 450-char compact truncation, `ts_iso` timestamps, scoped `search_messages`, `audit.jsonl`, and `--no-key-cache`. See [CHANGELOG.md](./CHANGELOG.md).
+
 ## Safe by Design
 
 - **Strictly Read-Only** — Never sends messages, never automates or clicks WeChat windows, and never modifies your WeChat files.
-- **Content Is Data** — Message text, filenames, link titles, and quoted replies are treated strictly as untrusted data, never as instructions; compact outputs defuse Markdown links so URLs are never auto-fetched.
+- **Content Is Data** — Message text, filenames, link titles, and quoted replies are treated strictly as untrusted data, never as instructions; compact outputs defuse clickable Markdown links (`](http` -> `] (http`) while bare URLs remain plain text governed by MCP `instructions` never to auto-fetch.
 - **100% Local & Audited** — Runs locally with zero cloud upload, logs read metadata (with SHA-256 hashed chat IDs) to `audit.jsonl`, and supports `--no-key-cache` for memory-only key handling.
 - **Open & Auditable** — Full architecture, DPAPI trust boundary, and local file scope live in [Architecture & Boundaries](docs/en/architecture.md).
 

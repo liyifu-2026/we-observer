@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Sequence
 
+from wx_observer import __version__
 from wx_observer.exceptions import WxObserverError
 from wx_observer.exporter import export_messages, format_json, format_jsonl
 from wx_observer.models import WatchMode
@@ -295,11 +296,16 @@ def _print_verify_summary(res: dict[str, Any]) -> None:
         f"| active={res['account_id']} | key_cache={res['key_cache_mode']}"
     )
     qc = "passed" if res.get("quick_check_passed") else "FAILED"
+    req_ok = res.get("verified_required_dbs", res.get("verified_dbs", 0))
+    req_tot = res.get("required_dbs", res.get("total_dbs", 0))
     print(
-        f"Decrypt: {res['verified_dbs']}/{res['total_dbs']} DBs ok "
-        f"(WAL merged {res['wal_frames_merged']} frames, quick_check {qc})"
+        f"Decrypt: {req_ok}/{req_tot} required DBs ok "
+        f"({res['verified_dbs']}/{res['total_dbs']} total, WAL merged {res['wal_frames_merged']} frames, quick_check {qc})"
     )
     print(f"Latest message: {res.get('latest_iso') or '-'} (chats={res.get('chats_count', 0)})")
+    failed_opt = res.get("failed_optional") or []
+    if failed_opt:
+        print(f"Optional skipped/failed ({len(failed_opt)}): {', '.join(failed_opt[:5])}")
     if not res.get("ok") and res.get("next_action"):
         print(f"next_action: {res['next_action']}")
 
@@ -313,7 +319,8 @@ def _print_doctor_summary(res: dict[str, Any]) -> None:
     )
     print(
         f"Discovery: db_dir={disc.get('db_dir_detected')} accounts={disc.get('accounts_count', 0)} "
-        f"(online={disc.get('online_accounts_count', 0)}) | DBs={res.get('keyed_dbs', 0)}/{res.get('total_dbs', 0)} "
+        f"(online={disc.get('online_accounts_count', 0)}) | "
+        f"DBs={res.get('keyed_dbs', 0)}/{res.get('total_dbs', 0)} keyed, {res.get('verified_dbs', 0)} verified "
         f"| key_cache={res.get('key_cache_mode')} | residual_tmp={res.get('temp_dir', {}).get('residual_session_dirs', 0)}"
     )
     if res.get("bundle_path"):
@@ -355,6 +362,7 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="wx-observer",
         description="Read-only Windows WeChat 4.x local message history extractor and real-time observer.",
     )
+    parser.add_argument("--version", "-V", action="version", version=f"%(prog)s {__version__}")
     _add_common_flags(parser, suppress_defaults=False)
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -469,6 +477,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p_verify = sub.add_parser("verify", parents=[common_sub], help="Verify account discovery, decryption, and DB health")
     p_verify.add_argument("--account", default=None)
     p_verify.add_argument("--pid", type=int, default=None)
+    p_verify.add_argument(
+        "--strict",
+        action="store_true",
+        help="Fail with exit code 2 if any optional/FTS database also fails quick_check",
+    )
 
     p_doctor = sub.add_parser("doctor", parents=[common_sub], help="Generate redacted diagnostic info or zip bundle")
     p_doctor.add_argument("--account", default=None)
@@ -661,12 +674,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
 
         if cmd == "verify":
-            res = service.verify(account=args.account, pid=args.pid)
+            res = service.verify(account=args.account, pid=args.pid, strict=bool(args.strict))
             if args.as_json:
                 print(format_json(res))
             else:
                 _print_verify_summary(res)
-            return 0 if res.get("ok") else 2
+            return int(res.get("exit_code", 0 if res.get("ok") else 2))
 
         if cmd == "doctor":
             res = service.doctor(account=args.account, pid=args.pid, bundle_path=args.bundle)

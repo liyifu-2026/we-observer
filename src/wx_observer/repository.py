@@ -25,6 +25,25 @@ from wx_observer.models import AccountInfo, ChatInfo, ChatType, MessageEvent
 from wx_observer.parser import decode_payload, parse_message_row, strip_group_sender_prefix
 
 _MESSAGE_SHARD_RE = re.compile(r"^(?:message/)?message_(\d+)\.db$", re.I)
+_FTS_DB_RE = re.compile(r"(?:^|/)(?:[^/]*_fts|fts_[^/]*)\.db$", re.I)
+_SUPPORT_DB_BASENAMES = frozenset({"contact.db", "session.db"})
+
+
+def classify_db_role(rel_path: str) -> str:
+    """Classify a WeChat 4.x database file role as message, support, fts, or aux."""
+    norm = str(rel_path or "").replace("\\", "/")
+    if _MESSAGE_SHARD_RE.match(norm):
+        return "message"
+    if os.path.basename(norm).lower() in _SUPPORT_DB_BASENAMES:
+        return "support"
+    if _FTS_DB_RE.match(norm):
+        return "fts"
+    return "aux"
+
+
+def is_required_db_role(role: str) -> bool:
+    """Return True for core databases required for history, search, digest, and monitoring."""
+    return role in ("message", "support")
 _MSG_TYPE_TO_BASE_TYPES: dict[str, tuple[int, ...]] = {
     "text": (1, 49),
     "image": (3,),
@@ -1519,28 +1538,57 @@ class AccountRepository:
             {"chat_id": chat_id, "seq": seq, "message_id": message_id},
         )
 
-    def verify_health(self) -> dict[str, Any]:
+    def verify_health(self, *, strict: bool = False) -> dict[str, Any]:
         """Verify decryption, WAL merge, PRAGMA quick_check, and latest message timestamp."""
         self._ensure_shards_up_to_date()
-        keyed_rels = sorted(rel for rel in self._db_files if rel in self._keys)
+        all_rels = sorted(self._db_files)
+        keyed_rels = [rel for rel in all_rels if rel in self._keys]
+        prefetch_warnings: list[str] = []
         if len(keyed_rels) >= 2:
-            self.pool.prefetch_snapshots(keyed_rels)
+            try:
+                self.pool.prefetch_snapshots(keyed_rels, ignore_errors=True)
+            except Exception as exc:
+                prefetch_warnings.append(f"Prefetch degraded: {type(exc).__name__}: {exc}")
 
         verified_dbs = 0
-        failed_dbs: list[str] = []
+        required_dbs = 0
+        verified_required_dbs = 0
+        failed_required: list[str] = []
+        failed_optional: list[str] = []
         wal_frames_merged = 0
-        for rel in keyed_rels:
+
+        for rel in all_rels:
+            role = classify_db_role(rel)
+            required = is_required_db_role(role)
+            if required:
+                required_dbs += 1
+
+            if rel not in self._keys:
+                if required:
+                    failed_required.append(rel)
+                else:
+                    failed_optional.append(rel)
+                continue
+
             try:
                 snap = self.pool.ensure_snapshot(rel)
                 if quick_check_sqlite(snap):
                     verified_dbs += 1
+                    if required:
+                        verified_required_dbs += 1
                     st = self.pool.get_snapshot_state(rel)
                     if st is not None and st.applied_frames > 0:
                         wal_frames_merged += st.applied_frames
                 else:
-                    failed_dbs.append(rel)
+                    if required:
+                        failed_required.append(rel)
+                    else:
+                        failed_optional.append(rel)
             except Exception:
-                failed_dbs.append(rel)
+                if required:
+                    failed_required.append(rel)
+                else:
+                    failed_optional.append(rel)
 
         chats_count = 0
         latest_ts = 0
@@ -1567,18 +1615,45 @@ class AccountRepository:
                 except Exception:
                     continue
 
+        failed_dbs = sorted(failed_required + failed_optional)
+        if strict:
+            quick_check_passed = (
+                verified_dbs == self.total_db_count and not failed_dbs and self.total_db_count > 0
+            )
+        else:
+            quick_check_passed = required_dbs > 0 and not failed_required
+
+        if not quick_check_passed:
+            exit_code = 2
+        elif failed_optional:
+            exit_code = 1
+        else:
+            exit_code = 0
+
+        warnings = list(dict.fromkeys([*self.warnings, *prefetch_warnings]))
+        if failed_optional:
+            warnings.append(
+                f"Optional/aux databases failed decryption or quick_check ({len(failed_optional)}): "
+                + ", ".join(failed_optional[:5])
+            )
+
         return {
             "total_dbs": self.total_db_count,
             "keyed_dbs": self.keyed_db_count,
             "verified_dbs": verified_dbs,
+            "required_dbs": required_dbs,
+            "verified_required_dbs": verified_required_dbs,
             "failed_dbs": failed_dbs,
-            "quick_check_passed": (
-                verified_dbs == self.total_db_count and not failed_dbs and self.total_db_count > 0
-            ),
+            "failed_required": failed_required,
+            "failed_optional": failed_optional,
+            "strict": bool(strict),
+            "degraded": bool(quick_check_passed and failed_optional),
+            "exit_code": exit_code,
+            "quick_check_passed": quick_check_passed,
             "wal_frames_merged": wal_frames_merged,
             "chats_count": chats_count,
             "latest_timestamp": latest_ts,
-            "warnings": self.warnings,
+            "warnings": warnings,
         }
 
     def inspect_db_metadata(self) -> list[dict[str, Any]]:
@@ -1632,9 +1707,12 @@ class AccountRepository:
                     quick_ok = False
                     wal_warning = f"{type(exc).__name__}"
 
+            role = classify_db_role(rel)
             entries.append(
                 {
                     "rel_path": rel,
+                    "role": role,
+                    "required": is_required_db_role(role),
                     "size_bytes": size_bytes,
                     "wal_exists": wal_exists,
                     "wal_size_bytes": wal_size,

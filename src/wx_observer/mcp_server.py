@@ -219,7 +219,7 @@ def create_mcp_server(
         name="expand_chat_history",
         description=(
             "Expand a forwarded chat_history message (type='chat_history') by seq or message_id "
-            "into individual forwarded items and resolve embedded file local paths."
+            "into individual forwarded items (default limit=20; pass limit=0 to expand all) and resolve embedded file local paths."
         ),
         annotations=_READONLY_TOOL,
     )
@@ -227,6 +227,7 @@ def create_mcp_server(
         chat: str,
         seq: int | None = None,
         message_id: str | None = None,
+        limit: int = 20,
         max_text_chars: int | None = None,
         account: str | None = None,
     ) -> dict[str, Any]:
@@ -236,12 +237,14 @@ def create_mcp_server(
                 "chat": chat,
                 "seq": seq,
                 "message_id": message_id,
+                "limit": limit,
                 "account": account,
             },
             service.expand_chat_history,
             chat,
             seq=seq,
             message_id=message_id,
+            limit=limit,
             max_text_chars=max_text_chars,
             account=account,
         )

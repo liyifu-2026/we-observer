@@ -49,7 +49,7 @@ sequenceDiagram
 ## Strict Read-Only Guarantees & Local Files
 
 - **No Write or UI Path to WeChat**: Zero message sending, zero keyboard/mouse/UI automation, zero DLL injection, zero process memory writes, and zero version-hardcoded binary signatures/RVAs.
-- **Untrusted Content Boundary**: MCP `instructions` explicitly declare all message text, filenames, link titles, and quoted replies as untrusted data; shaped items include `"untrusted": true` and defuse Markdown links (`](http`) to mitigate prompt-injection and URL auto-fetch exfiltration.
+- **Untrusted Content Boundary**: MCP `instructions` explicitly declare all message text, filenames, link titles, and quoted replies as untrusted data and forbid auto-fetching URLs; shaped items include `"untrusted": true` and defuse clickable Markdown links (`](http` -> `] (http`), while bare URLs remain plain text governed by those `instructions`.
 - **Local Files Created by `wx-observer`**:
   - DPAPI-encrypted key cache: `%LOCALAPPDATA%\wx-observer\keys\` (omitted under `--no-key-cache`)
   - Watch cursor SQLite database: `%LOCALAPPDATA%\wx-observer\state.db` (or `--state-dir`)

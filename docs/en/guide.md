@@ -62,12 +62,12 @@ print(format_markdown([message]))
 
 ## 2. CLI Reference
 
-Add `--help` after any subcommand for full flags (e.g. `wx-observer digest --help`). Global flags (`--db-dir`, `--keys-file`, `--state-dir`, `--no-key-cache`, `--audit`, `--json`) can be passed before or after the subcommand.
+Add `--help` after any subcommand for full flags (e.g. `wx-observer digest --help`). Global flags (`--version`/`-V`, `--db-dir`, `--keys-file`, `--state-dir`, `--no-key-cache`, `--audit`, `--json`) can be passed before or after the subcommand.
 
 | Command | Purpose | Example |
 | --- | --- | --- |
 | `accounts` | List discovered WeChat directories and live `Weixin.exe` PIDs | `wx-observer accounts --json` |
-| `verify` | Run 3-line health check: account count, quick_check, and latest message | `wx-observer verify` |
+| `verify` | Run 3-line health check (exit `0` ok, `1` optional/FTS degraded, `2` required or `--strict` failed) | `wx-observer verify` |
 | `doctor` | Collect redacted OS/Python/WeChat/shard diagnostics (or zip bundle) | `wx-observer doctor --bundle doctor.zip` |
 | `chats` | Filter private/group chats by name, remark, or `chat_id` | `wx-observer chats --type group --name-query "读书"` |
 | `history` | Read chat history and export to `md` / `csv` / `json` / `jsonl` | `wx-observer history "<chat>" --since 7d --export md --output out.md` |

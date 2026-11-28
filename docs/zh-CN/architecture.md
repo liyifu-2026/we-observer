@@ -49,7 +49,7 @@ sequenceDiagram
 ## 严格只读边界与本地文件范围
 
 - **对微信绝对只读**：不发送微信消息、不模拟键鼠或操作微信窗口、不注入 DLL、不写入目标进程内存，也不依赖针对二进制特征码或版本固定 RVA 偏移的读取方式。
-- **内容即数据（防提示词注入与外泄）**：MCP `instructions` 明确声明所有消息正文、文件名、链接标题与引用内容均为不可信数据；消息条目附带 `"untrusted": true` 并拆断 Markdown 链接（`](http`），防止自动渲染或抓取外泄。
+- **内容即数据（防提示词注入与外泄）**：MCP `instructions` 明确声明所有消息正文、文件名、链接标题与引用内容均为不可信数据并禁止自动抓取 URL；消息条目附带 `"untrusted": true` 且拆断可点击 Markdown 链接（`](http` -> `] (http`），裸 URL 保持纯文本并受 `instructions` 约束。
 - **本机落地文件仅限以下受控位置**：
   - DPAPI 加密密钥缓存：`%LOCALAPPDATA%\wx-observer\keys\`（传 `--no-key-cache` 时不写入）
   - 游标进度数据库：`%LOCALAPPDATA%\wx-observer\state.db`（或 `--state-dir` 指定目录）

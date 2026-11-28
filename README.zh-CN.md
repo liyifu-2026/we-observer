@@ -48,10 +48,16 @@
 
 需要手动安装步骤或查看全部 CLI 命令，请看[使用指南](docs/zh-CN/guide.md)。
 
+## v0.4.0 新特性
+
+- **开箱自检与配置生成** — `wx-observer verify` 核验核心分片解密（可选 `*_fts.db` 失败时降级告警而不误报阻塞），`wx-observer doctor --bundle doctor.zip` 生成脱敏诊断包，`wx-observer mcp --print-config <client>` 直接输出各客户端可粘贴配置。
+- **转发聊天记录展开** — 新增 `expand_chat_history` MCP 工具展开嵌套转发记录（默认 `limit=20`，`0` 展开全部），并与 `list_attachments` 统一内嵌文件本地路径与 `next_action` 语义。
+- **更完善的身份、摘要与审计** — 补齐本机 `self` 与 `top_senders[].is_self`、450 字 `head_tail` 截断、带年份的 `ts_iso`、`search_messages` 多群作用域、`audit.jsonl` 与 `--no-key-cache`。详见 [CHANGELOG.md](./CHANGELOG.md)。
+
 ## 为什么可以放心用
 
 - **绝对只读** — 绝不代发消息、绝不模拟键鼠或操控微信窗口，也不会改动微信自己的任何文件。
-- **内容即数据** — 群消息正文、文件名、链接标题与引用内容一律视作不可信第三方数据，绝不当作指令执行；紧凑输出会自动拆断 Markdown 链接以防止自动外泄抓取。
+- **内容即数据** — 群消息正文、文件名、链接标题与引用内容一律视作不可信第三方数据，绝不当作指令执行；紧凑输出会自动拆断可点击 Markdown 链接（`](http` -> `] (http`），裸 `https://` 文本由 MCP `instructions` 约束禁止自动抓取。
 - **纯本地且可追溯** — 零联网上传，每次读取写入脱敏审计日志 `audit.jsonl`（会话 ID 经 SHA-256 截断），并支持 `--no-key-cache` 纯内存取密。
 - **开源可审计** — 完整技术原理、DPAPI 信任边界与本机文件范围见[工作原理与安全边界](docs/zh-CN/architecture.md)。
 

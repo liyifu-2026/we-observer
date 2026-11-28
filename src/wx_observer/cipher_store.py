@@ -562,6 +562,7 @@ class EncryptedDatabasePool:
         rel_paths: Sequence[str],
         *,
         force_rebuild: bool = False,
+        ignore_errors: bool = False,
     ) -> None:
         """Warm multiple database snapshots concurrently when 2+ targets need refresh."""
         if self._closed:
@@ -573,7 +574,13 @@ class EncryptedDatabasePool:
         with ThreadPoolExecutor(max_workers=min(4, len(pending))) as executor:
             futures = [executor.submit(self.ensure_snapshot, rel, force_rebuild) for rel in pending]
             for fut in futures:
-                fut.result()
+                if ignore_errors:
+                    try:
+                        fut.result()
+                    except Exception:
+                        pass
+                else:
+                    fut.result()
 
     def open_readonly(self, rel_path: str, force_rebuild: bool = False) -> sqlite3.Connection:
         snap = self.ensure_snapshot(rel_path, force_rebuild=force_rebuild)

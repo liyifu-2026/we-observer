@@ -397,8 +397,8 @@ def enrich_embedded_files(
             file_index=file_index,
             verify_md5=verify_md5,
         )
-        item["available"] = resolved["available"]
-        item["local_path"] = resolved["local_path"]
+        item["available"] = bool(resolved["available"])
+        item["local_path"] = resolved["local_path"] or None
         if resolved.get("match_confidence"):
             item["match_confidence"] = resolved["match_confidence"]
         if item.get("size_bytes") is None and resolved.get("actual_size_bytes") is not None:
@@ -527,7 +527,7 @@ def collect_attachments(
                         if not resolved["available"]:
                             continue
                         avail = True
-                        local_path = resolved["local_path"]
+                        local_path = resolved["local_path"] or None
                         confidence = resolved.get("match_confidence")
                         size_bytes = item.get("size_bytes") or resolved.get("actual_size_bytes")
                     else:
@@ -576,8 +576,8 @@ def collect_attachments(
             file_index=file_index,
             verify_md5=True,
         )
-        entry["available"] = resolved["available"]
-        entry["local_path"] = resolved["local_path"]
+        entry["available"] = bool(resolved["available"])
+        entry["local_path"] = resolved["local_path"] or None
         entry["match_confidence"] = resolved.get("match_confidence")
         if entry["size_bytes"] is None:
             entry["size_bytes"] = resolved.get("actual_size_bytes")

@@ -46,17 +46,17 @@ def sha256_prefix(value: str, length: int = 12) -> str:
     return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:length]
 
 
-def _count_rows(result: dict[str, Any]) -> int:
-    for key in ("messages", "chats", "attachments", "items", "accounts"):
-        val = result.get(key)
-        if isinstance(val, list):
-            return len(val)
+def _count_rows(result: dict[str, Any]) -> tuple[int, str]:
     if isinstance(result.get("per_chat"), list):
         summary = result.get("summary")
         if isinstance(summary, dict) and isinstance(summary.get("total_messages"), int):
-            return int(summary["total_messages"])
-        return len(result["per_chat"])
-    return 0
+            return int(summary["total_messages"]), "matched_messages"
+        return len(result["per_chat"]), "per_chat"
+    for key in ("messages", "chats", "attachments", "items", "accounts"):
+        val = result.get(key)
+        if isinstance(val, list):
+            return len(val), key
+    return 0, "none"
 
 
 class AuditLogger:
@@ -210,7 +210,14 @@ class AuditLogger:
                 entry[key] = val
 
         ok = bool(r.get("ok", True))
-        entry["rows"] = _count_rows(r)
+        rows_count, rows_kind = _count_rows(r)
+        entry["rows"] = rows_count
+        entry["rows_kind"] = rows_kind
+        if isinstance(r.get("per_chat"), list):
+            entry["returned_chats"] = len(r["per_chat"])
+            summary = r.get("summary")
+            if isinstance(summary, dict) and isinstance(summary.get("total_messages"), int):
+                entry["matched_messages"] = int(summary["total_messages"])
         if isinstance(r.get("est_tokens"), int):
             entry["est_tokens"] = int(r["est_tokens"])
         entry["ok"] = ok

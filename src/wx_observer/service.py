@@ -592,11 +592,16 @@ class ObserverService:
         *,
         seq: int | None = None,
         message_id: str | int | None = None,
+        limit: int = 20,
         max_text_chars: int | None = None,
         account: str | None = None,
         pid: int | None = None,
     ) -> dict[str, Any]:
         """Expand a forwarded chat_history message into items and resolve embedded files."""
+        eff_limit: int | None = None
+        if limit is not None and int(limit) > 0:
+            eff_limit = max(1, min(int(limit), 500))
+
         repo, _mon, _chosen = self._open_or_reuse(account=account, pid=pid, make_default=False)
         chat_info = repo.resolve_chat(chat)
         raw_hit = repo.get_chat_history_raw(
@@ -638,8 +643,8 @@ class ObserverService:
                     if enriched_list:
                         f_meta = enriched_list[0]
                         item["meta"] = f_meta
-                        item["available"] = f_meta["available"]
-                        item["local_path"] = f_meta["local_path"]
+                        item["available"] = bool(f_meta["available"])
+                        item["local_path"] = f_meta["local_path"] or None
                         if "next_action" in f_meta:
                             item["next_action"] = f_meta["next_action"]
                         out_files.append(dict(f_meta))
@@ -660,6 +665,18 @@ class ObserverService:
                 verify_md5=True,
             )
 
+        total_items = len(items_out)
+        total_embedded_files = len(embedded_files_out)
+        available_files_count = sum(1 for f in embedded_files_out if f.get("available"))
+
+        if eff_limit is not None and total_items > eff_limit:
+            items_out = items_out[:eff_limit]
+            if len(embedded_files_out) > eff_limit:
+                embedded_files_out = embedded_files_out[:eff_limit]
+
+        omitted_items = total_items - len(items_out)
+        truncated = bool(omitted_items > 0 or total_embedded_files > len(embedded_files_out))
+
         payload: dict[str, Any] = {
             "ok": True,
             "account_id": repo.account.account_id,
@@ -670,12 +687,20 @@ class ObserverService:
             "ts_iso": format_local_iso(ev.timestamp, ev.iso_time),
             "sender": ev.sender_name or ev.sender_id or ("我" if ev.is_self else ""),
             "title": parsed["title"] or ev.metadata.get("title") or "",
+            "total_items": total_items,
             "item_count": len(items_out),
+            "omitted_items": omitted_items,
+            "truncated": truncated,
             "items": items_out,
-            "embedded_files_count": len(embedded_files_out),
-            "available_files_count": sum(1 for f in embedded_files_out if f.get("available")),
+            "embedded_files_count": total_embedded_files,
+            "available_files_count": available_files_count,
             "embedded_files": embedded_files_out,
         }
+        if truncated:
+            payload["next_action"] = (
+                f"{omitted_items} more forwarded items omitted; "
+                f"pass limit={total_items} (or limit=0) to expand all."
+            )
         payload["est_tokens"] = estimate_tokens(payload)
         return payload
 
@@ -1041,6 +1066,7 @@ class ObserverService:
         *,
         account: str | None = None,
         pid: int | None = None,
+        strict: bool = False,
     ) -> dict[str, Any]:
         """Run end-to-end discovery, decryption, quick_check, and latest-message verification."""
         env = discover_environment(db_dir=self.db_dir)
@@ -1048,7 +1074,7 @@ class ObserverService:
         online_count = sum(1 for a in accounts if a.online)
         offline_count = len(accounts) - online_count
         repo, _mon, chosen = self._open_or_reuse(account=account, pid=pid, make_default=False)
-        health = repo.verify_health()
+        health = repo.verify_health(strict=strict)
         latest_ts = int(health["latest_timestamp"] or 0)
         ok = bool(health["quick_check_passed"])
         res: dict[str, Any] = {
@@ -1059,10 +1085,17 @@ class ObserverService:
             "accounts_online": online_count,
             "accounts_offline": offline_count,
             "key_cache_mode": self.key_cache_mode,
+            "strict": health["strict"],
+            "degraded": health["degraded"],
+            "exit_code": health["exit_code"],
             "total_dbs": health["total_dbs"],
             "keyed_dbs": health["keyed_dbs"],
             "verified_dbs": health["verified_dbs"],
+            "required_dbs": health["required_dbs"],
+            "verified_required_dbs": health["verified_required_dbs"],
             "failed_dbs": health["failed_dbs"],
+            "failed_required": health["failed_required"],
+            "failed_optional": health["failed_optional"],
             "quick_check_passed": health["quick_check_passed"],
             "wal_frames_merged": health["wal_frames_merged"],
             "chats_count": health["chats_count"],
@@ -1073,7 +1106,7 @@ class ObserverService:
         }
         if not ok:
             res["next_action"] = (
-                "One or more databases failed key validation or quick_check; "
+                "One or more required databases failed key validation or quick_check; "
                 "verify WeChat is logged in or run `wx-observer doctor --bundle doctor.zip`."
             )
         return res

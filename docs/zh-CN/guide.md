@@ -62,12 +62,12 @@ print(format_markdown([message]))
 
 ## 2. CLI 子命令参考
 
-任意子命令后加 `--help` 可查看全部筛选参数（如 `wx-observer digest --help`）。全局参数（`--db-dir`、`--keys-file`、`--state-dir`、`--no-key-cache`、`--audit`、`--json`）支持放在子命令前或后。
+任意子命令后加 `--help` 可查看全部筛选参数（如 `wx-observer digest --help`）。全局参数（`--version`/`-V`、`--db-dir`、`--keys-file`、`--state-dir`、`--no-key-cache`、`--audit`、`--json`）支持放在子命令前或后。
 
 | 子命令 | 核心用途 | 常用示例 |
 | --- | --- | --- |
 | `accounts` | 列出发现的微信数据目录与在线 `Weixin.exe` PID | `wx-observer accounts --json` |
-| `verify` | 3 行自检：账号发现、分片解密/quick_check 校验与最新消息时间 | `wx-observer verify` |
+| `verify` | 3 行自检（退出码 `0` 全通过、`1` 仅可选/FTS 库异常、`2` 必需库或 `--strict` 失败） | `wx-observer verify` |
 | `doctor` | 导出脱敏诊断报告或 zip 包（含版本、分片清单、密钥来源、WAL 状态） | `wx-observer doctor --bundle doctor.zip` |
 | `chats` | 按会话类型、名称、备注或 `chat_id` 列出并筛选会话 | `wx-observer chats --type group --name-query "读书"` |
 | `history` | 提取会话历史，或导出为 `md` / `csv` / `json` / `jsonl` | `wx-observer history "<群名>" --since 7d --export md --output out.md` |

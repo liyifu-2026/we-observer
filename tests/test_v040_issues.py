@@ -619,3 +619,123 @@ def test_issue13_unified_params_aliases_and_status_readiness(tmp_path) -> None:
         assert st["status"]["initialized"] is False
     finally:
         service.close()
+
+
+def test_verify_optional_fts_failure_degrades_cleanly_and_strict_fails(tmp_path, capsys) -> None:
+    import os
+    from tests.fixtures import encrypt_sqlite_image
+
+    env = SyntheticAccountEnv(tmp_path / "wx")
+
+    # 1) Keyed optional FTS DB whose Page-1 HMAC passes (so keyed=True) but SQLite body is corrupt
+    corrupt_plain = bytearray(b"SQLite format 3\x00" + b"\xff" * (4096 - 16))
+    fts_key = bytes.fromhex("22" * 32)
+    fts_salt = b"fts-salt-0123456"
+    fts_path = env.storage_dir / "contact" / "contact_fts.db"
+    fts_path.write_bytes(encrypt_sqlite_image(bytes(corrupt_plain), fts_key, salt=fts_salt))
+    env.keys_hex["contact/contact_fts.db"] = fts_key.hex()
+
+    # 2) Unkeyed optional FTS DB
+    (env.storage_dir / "message" / "message_fts.db").write_bytes(b"Z" * 4096)
+    env.keys_file.write_text(json.dumps({"keys": env.keys_hex}), encoding="utf-8")
+
+    common = [
+        "--db-dir", str(env.db_dir),
+        "--keys-file", str(env.keys_file),
+        "--state-dir", str(tmp_path / "state"),
+    ]
+
+    # Non-strict verify degrades with exit code 1 (all required DBs ok, only optional FTS failed)
+    rc_deg = cli_main([*common, "verify", "--account", env.account_id, "--json"])
+    assert rc_deg == 1
+    deg_out = json.loads(capsys.readouterr().out)
+    assert deg_out["ok"] is True
+    assert deg_out["degraded"] is True
+    assert deg_out["quick_check_passed"] is True
+    assert deg_out["failed_required"] == []
+    assert sorted(deg_out["failed_optional"]) == ["contact/contact_fts.db", "message/message_fts.db"]
+    assert deg_out["verified_required_dbs"] == deg_out["required_dbs"]
+
+    # Strict verify fails with exit code 2
+    rc_strict = cli_main([*common, "verify", "--strict", "--account", env.account_id, "--json"])
+    assert rc_strict == 2
+    strict_out = json.loads(capsys.readouterr().out)
+    assert strict_out["ok"] is False
+    assert strict_out["quick_check_passed"] is False
+
+    # Doctor summary reports keyed vs verified counts consistently
+    rc_doc = cli_main([*common, "doctor", "--account", env.account_id])
+    assert rc_doc == 0
+    doc_txt = capsys.readouterr().out
+    assert "5/6 keyed, 4 verified" in doc_txt
+
+    # Corrupting a required DB (message_0.db) fails verify with exit code 2 even without --strict
+    msg0 = env.storage_dir / "message" / "message_0.db"
+    msg0.write_bytes(b"\x00" * 4096)
+    os.utime(msg0, None)
+    rc_req_fail = cli_main([*common, "verify", "--account", env.account_id, "--json"])
+    assert rc_req_fail == 2
+    req_out = json.loads(capsys.readouterr().out)
+    assert req_out["ok"] is False
+    assert "message/message_0.db" in req_out["failed_required"]
+
+
+def test_cli_version_expand_limit_and_audit_rows_kind(tmp_path, capsys) -> None:
+    with pytest.raises(SystemExit) as exc_ver:
+        cli_main(["--version"])
+    assert exc_ver.value.code == 0
+    assert "0.4.0" in capsys.readouterr().out
+
+    env = SyntheticAccountEnv(tmp_path / "wx")
+    now = int(time.time())
+    items_xml = "".join(
+        f'<dataitem datatype="8"><datatitle>doc_{i}.pdf</datatitle><datasize>128</datasize><datafmt>pdf</datafmt></dataitem>'
+        for i in range(25)
+    )
+    fwd_xml = (
+        f"<msg><appmsg><type>19</type><title>Big Bundle</title><recorditem><![CDATA["
+        f"<recordinfo><datalist>{items_xml}</datalist></recordinfo>]]></recorditem></appmsg></msg>"
+    )
+    env.append_wal_messages(env.room_id, [(95, (19 << 32) | 49, 999, 3, now - 5, f"{env.alice_id}:\n{fwd_xml}")])
+
+    state_dir = tmp_path / "state"
+    service = ObserverService(
+        db_dir=str(env.db_dir),
+        keys_file=str(env.keys_file),
+        state_dir=state_dir,
+        temp_root=tmp_path / "pool",
+    )
+    try:
+        # Default limit=20 truncates 25 items and preserves local_path=None
+        exp_default = service.expand_chat_history(env.room_id, seq=999, account=env.account_id)
+        assert exp_default["total_items"] == 25
+        assert exp_default["item_count"] == 20
+        assert exp_default["omitted_items"] == 5
+        assert exp_default["truncated"] is True
+        assert exp_default["embedded_files_count"] == 25
+        assert exp_default["items"][0]["local_path"] is None
+        assert "limit=25" in exp_default["next_action"]
+
+        # limit=0 expands all 25
+        exp_all = service.expand_chat_history(env.room_id, seq=999, limit=0, account=env.account_id)
+        assert exp_all["item_count"] == 25
+        assert exp_all["omitted_items"] == 0
+        assert exp_all["truncated"] is False
+
+        # Audit records rows_kind for digest and get_messages
+        server = create_mcp_server(service)
+
+        async def run_audit_tools() -> None:
+            async with Client(server) as client:
+                await client.call_tool("digest", {"since": "24h", "account": env.account_id})
+                await client.call_tool("get_messages", {"chat": env.room_id, "limit": 5, "account": env.account_id})
+
+        anyio.run(run_audit_tools)
+        lines = [json.loads(line) for line in (state_dir / "audit.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+        by_tool = {rec["tool"]: rec for rec in lines}
+        assert by_tool["digest"]["rows_kind"] == "matched_messages"
+        assert "matched_messages" in by_tool["digest"]
+        assert "returned_chats" in by_tool["digest"]
+        assert by_tool["get_messages"]["rows_kind"] == "messages"
+    finally:
+        service.close()

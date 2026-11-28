@@ -91,6 +91,18 @@ def build_doctor_report(
     except WxObserverError as exc:
         repo_error = exc.to_error_dict()
 
+    verified_dbs = sum(1 for db in databases if db.get("quick_check_ok") is True)
+    failed_required = [
+        db["rel_path"]
+        for db in databases
+        if db.get("required") and db.get("quick_check_ok") is not True
+    ]
+    failed_optional = [
+        db["rel_path"]
+        for db in databases
+        if not db.get("required") and db.get("quick_check_ok") is not True
+    ]
+
     return {
         "ok": repo_error is None,
         "wx_observer_version": __version__,
@@ -123,6 +135,9 @@ def build_doctor_report(
         },
         "total_dbs": total_dbs,
         "keyed_dbs": keyed_dbs,
+        "verified_dbs": verified_dbs,
+        "failed_required": failed_required,
+        "failed_optional": failed_optional,
         "databases": databases,
         "warnings": warnings,
         "repo_error": repo_error,
