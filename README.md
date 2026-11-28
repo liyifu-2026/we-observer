@@ -1,53 +1,61 @@
 <p align="center">
-  <img src="./assets/readme/hero-en.svg" width="100%" alt="wx-observer — Read-only Windows WeChat 4.x local history extractor and observer with CLI, MCP, and Skills">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./assets/readme/logo-dark.svg">
+    <img src="./assets/readme/logo-light.svg" width="64" height="64" alt="wx-observer logo">
+  </picture>
+</p>
+
+<h1 align="center">wx-observer</h1>
+
+<p align="center">
+  Give Claude, Cursor, and Codex read-only memory of your WeChat.
 </p>
 
 <p align="center">
   <strong>English</strong> · <a href="./README.zh-CN.md">简体中文</a> &nbsp;|&nbsp;
-  <a href="#demo">Demo</a> ·
-  <a href="#quick-start">Quick Start</a> ·
-  <a href="./docs/en/guide.md">Docs</a> ·
-  <a href="./docs/en/architecture.md">Architecture</a>
-</p>
-
-A strictly read-only local message history extractor and real-time observer for **Windows WeChat 4.x (`Weixin.exe`)**. Search and export conversations in your terminal, or let AI agents read bounded digests, local attachments, and live message streams via MCP and Agent Skills.
-
-## Demo
-
-<p align="center">
-  <img src="./assets/readme/terminal-demo.gif" width="100%" alt="wx-observer terminal demo using synthetic data: 24h cross-chat digest, quote-aware compact search, and MCP stdio startup">
+  <a href="#just-ask">Just Ask</a> ·
+  <a href="#1-line-setup">1-Line Setup</a> ·
+  <a href="./docs/en/guide.md">Docs</a>
 </p>
 
 <p align="center">
-  <sub>Synthetic data demo showing <code>digest</code> (cross-chat summary + local attachment path), <code>search --compact</code>, and <code>mcp --transport stdio</code>. Prefer a still image? View the <a href="./assets/readme/terminal-demo.svg">static SVG fallback</a>.</sub>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./assets/readme/demo-en-dark.gif">
+    <img src="./assets/readme/demo-en-light.gif" width="100%" alt="AI assistant reading local WeChat group decisions and finding a verified PDF attachment via wx-observer (synthetic demo)">
+  </picture>
 </p>
 
-## Highlights
+<p align="center">
+  <sub>Synthetic demo showing natural-language WeChat recall in an AI terminal. Prefer a still image? View the <a href="./assets/readme/demo-en.svg">static SVG</a>.</sub>
+</p>
 
-- **Strict Read-Only Boundary** — Reads SQLCipher4 + `-wal` snapshots via DPAPI-cached keys without sending messages, automating UI, or injecting into `Weixin.exe`.
-- **CLI Search & Multi-Format Export** — Query cross-shard history, verify downloaded attachments (including forwarded records), and export to Markdown, CSV, JSON, or JSONL.
-- **Agent-Native MCP Server** — Optional `[mcp]` extra exposes 12 read-only tools over `stdio` or localhost Streamable HTTP with token budgets, compact defaults, and idempotent `peek`/`ack` cursors.
-- **Built-In Agent Skills** — Includes four workflow guides under [`skills/`](skills/): [`wx-brief`](skills/wx-brief/SKILL.md), [`wx-find`](skills/wx-find/SKILL.md), [`wx-todo`](skills/wx-todo/SKILL.md), and [`wx-watch`](skills/wx-watch/SKILL.md).
+## Just Ask
 
-## Quick Start
+Once connected to your AI assistant, simply talk to it in plain language — no commands to memorize:
 
-Requires **64-bit Windows 10 / 11**, **64-bit Python 3.11+**, and desktop **WeChat 4.x (`Weixin.exe`)** running under the same Windows user and privilege level:
+- *"Summarize what the product and design groups decided yesterday."* — [`wx-brief`](skills/wx-brief/SKILL.md)
+- *"Find the quote PDF Chen sent last week and summarize the pricing."* — [`wx-find`](skills/wx-find/SKILL.md)
+- *"List everything where someone @mentioned me or gave me a deadline."* — [`wx-todo`](skills/wx-todo/SKILL.md)
+- *"Watch these two project groups and alert me when something urgent arrives."* — [`wx-watch`](skills/wx-watch/SKILL.md)
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e .
-.\.venv\Scripts\wx-observer.exe --help
+## 1-Line Setup
+
+Works on **Windows 10 / 11 (64-bit)** alongside desktop **WeChat 4.x** and any MCP-capable AI client. Paste this prompt directly to your AI assistant and let it handle installation:
+
+```text
+Install wx-observer from https://github.com/liyifu-2026/we-observer, configure its MCP server for this client, and install its 4 built-in skills.
 ```
 
-To enable the MCP server, install the optional extra with `.\.venv\Scripts\python.exe -m pip install -e ".[mcp]"`.
+Want manual setup, CLI commands, or tool details? See the [Usage Guide](docs/en/guide.md).
 
-## Documentation
+## Safe by Design
 
-| Guide | What's Inside |
-| --- | --- |
-| [Usage Guide](docs/en/guide.md) | Full CLI subcommands, MCP `stdio`/HTTP setup, 12-tool defaults, Skills installation, and offline export trial |
-| [Architecture & Boundaries](docs/en/architecture.md) | Mermaid call sequence diagram, WAL/DPAPI mechanisms, local storage footprint, and read-only guarantees |
+- **Strictly Read-Only** — Never sends messages, never automates or clicks WeChat windows, and never modifies your WeChat files.
+- **100% Local on Your PC** — Reads directly from your computer with zero cloud upload or external network calls.
+- **Open & Auditable** — Full architecture, sequence diagram, and local file scope live in [Architecture & Boundaries](docs/en/architecture.md).
 
-## License
+---
 
-For personal local data backup, technical learning, and research only — see [Architecture & Boundaries](docs/en/architecture.md) for terms of use. Released under the [MIT License](LICENSE).
+<p align="center">
+  <sub>For personal local backup and learning use only · <a href="./LICENSE">MIT License</a></sub>
+</p>

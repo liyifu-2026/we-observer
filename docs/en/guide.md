@@ -34,7 +34,7 @@ python -m venv .venv
 <details>
 <summary>Copy-paste prompt to let an AI coding assistant set this up</summary>
 
-> In the `wx-observer` repository root, verify 64-bit Windows and Python 3.11+, create an isolated `.venv`, install `.[mcp]` with `.venv\Scripts\python.exe`, run `wx-observer --help`, configure `stdio` MCP in my client settings, and report the exact executable and config file paths.
+> In the `wx-observer` repository root (or from `https://github.com/liyifu-2026/we-observer`), verify 64-bit Windows and Python 3.11+, create an isolated `.venv`, install `.[mcp]` with `.venv\Scripts\python.exe`, run `wx-observer --help`, configure `stdio` MCP in my client settings, copy `skills/wx-*` into my client skills directory, and report the exact paths installed.
 
 </details>
 

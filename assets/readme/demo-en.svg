@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="620" viewBox="0 0 1200 620" role="img" aria-labelledby="demo-title demo-desc">
+  <title id="demo-title">wx-observer AI assistant terminal demo (synthetic data)</title>
+  <desc id="demo-desc">Demonstrates an AI assistant reading recent WeChat group decisions and finding a local PDF attachment strictly read-only.</desc>
+
+  <defs>
+    <clipPath id="outer-clip">
+      <rect width="1200" height="620" rx="24"/>
+    </clipPath>
+    <clipPath id="win-clip">
+      <rect x="48" y="38" width="1104" height="544" rx="16"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#outer-clip)">
+    <rect width="1200" height="620" rx="24" fill="#F3EFE6"/>
+    <rect x="58" y="49" width="1104" height="544" rx="16" fill="#DDD6C7"/>
+    <rect x="52" y="43" width="1104" height="544" rx="16" fill="#CFC7B6"/>
+
+    <g clip-path="url(#win-clip)">
+      <rect x="48" y="38" width="1104" height="544" rx="16" fill="#131619"/>
+      <rect x="48" y="38" width="1104" height="46" fill="#1B2026"/>
+      <line x1="48" y1="84" x2="1152" y2="84" stroke="#262D35" stroke-width="1"/>
+
+      <circle cx="76" cy="61" r="5.5" fill="#EF4444" fill-opacity="0.75"/>
+      <circle cx="98" cy="61" r="5.5" fill="#E5A93C" fill-opacity="0.80"/>
+      <circle cx="120" cy="61" r="5.5" fill="#2CC97E" fill-opacity="0.85"/>
+      <text x="600" y="67" text-anchor="middle" fill="#94A3B8" font-family="'Cascadia Mono','Consolas','Microsoft YaHei UI','PingFang SC',ui-monospace,monospace" font-size="16.5">claude · wx-observer</text>
+
+      <rect x="1008" y="48" width="112" height="26" rx="13" fill="#122920" stroke="#2CC97E" stroke-width="1"/>
+      <circle cx="1025" cy="61" r="4" fill="#2CC97E"/>
+      <text x="1036" y="66" fill="#2CC97E" font-family="'Segoe UI','Microsoft YaHei UI','PingFang SC',-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="600">Read-only</text>
+
+      <g id="session-body">
+      <rect x="82" y="104" width="1036" height="54" rx="10" fill="#1A2028" stroke="#27303A" stroke-width="1"/>
+      <rect x="82" y="104" width="4" height="54" rx="2" fill="#2CC97E"/>
+      <text x="104" y="138" font-family="'Segoe UI','Microsoft YaHei UI','PingFang SC',-apple-system,BlinkMacSystemFont,sans-serif" font-size="19.5"><tspan fill="#2CC97E" font-family="'Cascadia Mono','Consolas','Microsoft YaHei UI','PingFang SC',ui-monospace,monospace" font-weight="700">&gt;</tspan> <tspan fill="#F8FAFC" font-weight="500">Summarize yesterday&#x27;s group decisions and find Chen&#x27;s release PDF.</tspan></text>
+      <circle cx="94" cy="188" r="8" fill="#122920" stroke="#2CC97E" stroke-width="1.5"/>
+      <polyline points="90,188 93,191 98.5,185" fill="none" stroke="#2CC97E" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="112" y="194" font-family="'Segoe UI','Microsoft YaHei UI','PingFang SC',-apple-system,BlinkMacSystemFont,sans-serif" font-size="18"><tspan fill="#CBD5E1" font-weight="600">Read WeChat (last 24h)</tspan><tspan dx="12" fill="#64748B">·</tspan><tspan dx="12" fill="#8B9EB0">3 active groups, 84 messages</tspan></text>
+      <circle cx="94" cy="220" r="8" fill="#122920" stroke="#2CC97E" stroke-width="1.5"/>
+      <polyline points="90,220 93,223 98.5,217" fill="none" stroke="#2CC97E" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="112" y="226" font-family="'Segoe UI','Microsoft YaHei UI','PingFang SC',-apple-system,BlinkMacSystemFont,sans-serif" font-size="18"><tspan fill="#CBD5E1" font-weight="600">Located local PDF</tspan><tspan dx="12" fill="#64748B">·</tspan><tspan dx="12" fill="#8B9EB0">release-v0.3.pdf verified on disk</tspan></text>
+      <line x1="82" y1="250" x2="1118" y2="250" stroke="#222931" stroke-width="1"/>
+      <text x="82" y="286" fill="#F8FAFC" font-family="'Segoe UI','Microsoft YaHei UI','PingFang SC',-apple-system,BlinkMacSystemFont,sans-serif" font-size="20" font-weight="700">Yesterday&#x27;s key group decisions</text>
+      <text x="86" y="320" fill="#E2E8F0" font-family="'Segoe UI','Microsoft YaHei UI','PingFang SC',-apple-system,BlinkMacSystemFont,sans-serif" font-size="18.5"><tspan fill="#2CC97E" font-weight="700">•</tspan><tspan dx="12" font-weight="600" fill="#F8FAFC">Book Club</tspan><tspan dx="8" fill="#8B9EB0">(09:30, Lin):</tspan><tspan dx="8" fill="#E2E8F0">Confirmed reading Chapter 3 this Friday</tspan></text>
+      <rect x="108" y="336" width="3" height="22" rx="1.5" fill="#E5A93C"/>
+      <text x="122" y="353" fill="#94A3B8" font-family="'Segoe UI','Microsoft YaHei UI','PingFang SC',-apple-system,BlinkMacSystemFont,sans-serif" font-size="17.5">Replying to Qing: &quot;Which chapter should we read next?&quot;</text>
+      <text x="86" y="388" fill="#E2E8F0" font-family="'Segoe UI','Microsoft YaHei UI','PingFang SC',-apple-system,BlinkMacSystemFont,sans-serif" font-size="18.5"><tspan fill="#2CC97E" font-weight="700">•</tspan><tspan dx="12" font-weight="600" fill="#F8FAFC">Release Group</tspan><tspan dx="8" fill="#8B9EB0">(14:15, Chen):</tspan><tspan dx="8" fill="#E2E8F0">Locked v0.3 scope and shared the release notes</tspan></text>
+      <text x="82" y="434" fill="#F8FAFC" font-family="'Segoe UI','Microsoft YaHei UI','PingFang SC',-apple-system,BlinkMacSystemFont,sans-serif" font-size="20" font-weight="700">Attachment ready to read</text>
+      <rect x="82" y="452" width="1036" height="48" rx="10" fill="#182026" stroke="#26313D" stroke-width="1"/>
+      <text x="102" y="482" font-family="'Cascadia Mono','Consolas','Microsoft YaHei UI','PingFang SC',ui-monospace,monospace" font-size="17.5"><tspan fill="#EDF2F7" font-weight="600">release-v0.3.pdf</tspan><tspan dx="14" fill="#64748B">-&gt;</tspan><tspan dx="14" fill="#60A5FA">...\msg\file\2026-05\release-v0.3.pdf</tspan></text>
+      <rect x="1012" y="463" width="88" height="26" rx="13" fill="#122920" stroke="#2CC97E" stroke-width="1"/>
+      <text x="1056" y="481" text-anchor="middle" fill="#2CC97E" font-family="'Segoe UI','Microsoft YaHei UI','PingFang SC',-apple-system,BlinkMacSystemFont,sans-serif" font-size="14.5" font-weight="700">Ready</text>
+      </g>
+
+      <line x1="82" y1="530" x2="1118" y2="530" stroke="#20272F" stroke-width="1"/>
+      <text x="82" y="559" fill="#64748B" font-family="'Cascadia Mono','Consolas','Microsoft YaHei UI','PingFang SC',ui-monospace,monospace" font-size="15.5">wx-observer  ·  100% local &amp; read-only  ·  Never sends messages</text>
+      <text x="1118" y="559" text-anchor="end" fill="#64748B" font-family="'Segoe UI','Microsoft YaHei UI','PingFang SC',-apple-system,BlinkMacSystemFont,sans-serif" font-size="15">Synthetic demo</text>
+    </g>
+    <rect x="48.5" y="38.5" width="1103" height="543" rx="16" fill="none" stroke="#262C33" stroke-width="1.2"/>
+  </g>
+  <rect x="0.75" y="0.75" width="1198.5" height="618.5" rx="24" fill="none" stroke="#E1DACB" stroke-width="1.5"/>
+</svg>

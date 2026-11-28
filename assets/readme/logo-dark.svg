@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="88" height="88" viewBox="0 0 88 88" role="img" aria-labelledby="logo-dark-title logo-dark-desc">
+  <title id="logo-dark-title">wx-observer icon</title>
+  <desc id="logo-dark-desc">Rounded chat bubble enclosing an emerald observer lens, symbolizing read-only WeChat memory for AI agents.</desc>
+
+  <rect x="1" y="1" width="86" height="86" rx="22" fill="#1E2220" stroke="#38403B" stroke-width="2"/>
+  <path d="M28 21 H60 A12 12 0 0 1 72 33 V51 A12 12 0 0 1 60 63 H35 L22 70 L25.5 62.74 A12 12 0 0 1 16 51 V33 A12 12 0 0 1 28 21 Z" fill="#F5F3EC"/>
+  <circle cx="44" cy="42" r="13.5" fill="#161817"/>
+  <circle cx="44" cy="42" r="10.2" fill="#0F241B" stroke="#2CC97E" stroke-width="2.5"/>
+  <circle cx="44" cy="42" r="4.6" fill="#2CC97E"/>
+  <circle cx="47.4" cy="38.6" r="1.7" fill="#F5F3EC"/>
+</svg>

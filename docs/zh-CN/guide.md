@@ -34,7 +34,7 @@ python -m venv .venv
 <details>
 <summary>让 AI 编程助手代为安装的提示词模板</summary>
 
-> 请在当前 `wx-observer` 仓库确认 64 位 Windows 与 Python 3.11+ 环境，创建独立 `.venv` 并用其中的 Python 执行 `pip install -e ".[mcp]"`；运行 `wx-observer --help` 验证入口，再为当前客户端配置 `stdio` MCP，最后告诉我实际可执行文件路径与配置文件位置。
+> 请在当前 `wx-observer` 仓库（或从 `https://github.com/liyifu-2026/we-observer` 克隆）确认 64 位 Windows 与 Python 3.11+ 环境，创建独立 `.venv` 并用其中的 Python 执行 `pip install -e ".[mcp]"`；运行 `wx-observer --help` 验证入口，为当前客户端配置 `stdio` MCP 并把 `skills/wx-*` 复制到客户端 Skills 目录，最后告诉我实际路径与配置位置。
 
 </details>
 
